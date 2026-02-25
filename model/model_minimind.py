@@ -1,43 +1,96 @@
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-#                                             MiniMind Config
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-
 from transformers import PretrainedConfig
+# 在深度学习中，一个模型由两部分组成：
+# 权重（Weights）： 模型的“记忆”，即那些巨大的参数矩阵。
+# 配置（Configuration）： 模型的“结构”，比如它有几层、每层有多宽、词汇表有多大等。
 
+# 它的核心作用：
+# - 定义结构： 它规定了模型的超参数（比如 hidden_size 隐藏层维度、num_attention_heads 注意力头数等）。
+# - 加载与保存： 它可以从本地文件夹或 Hugging Face Hub 上读取 config.json 文件，也可以把当前的配置保存成 JSON。
+# - 模型初始化的桥梁： 当你创建一个模型时，系统会先看这个“说明书”，知道该盖多少层楼、挖多深的基座，然后再把“权重”填进去。
+
+# PretrainedConfig 是所有模型配置类的“祖宗”，它不负责计算，只负责告诉程序这个模型长什么样。使用 PretrainedConfig 是为了更好的兼容性和标准化。
 
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
+    # 告诉 Hugging Face 库，这个配置对应的模型类型是 minimind
+    # 这里的 model_type 是类变量，所有实例共享这个变量。
 
     def __init__(
             self,
             dropout: float = 0.0,
+            # 随机失活率，防止过拟合。
             bos_token_id: int = 1,
+            # 开始标记的 ID，用于标识句子的开始，详情去看 tokenizer.json。
+            # <|im_start|> 就是标号为 1。
             eos_token_id: int = 2,
+            # 结束标记的 ID，用于标识句子的结束，详情去看 tokenizer.json。
+            # <|im_end|> 就是标号为 2。
             hidden_act: str = 'silu',
+            # 隐藏层激活函数，常用的有 ReLU、SiLU 等。
+            # 这代表模型中主要计算层（MLP/FFN层）的所有隐藏激活函数都统一使用 SiLU。
             hidden_size: int = 512,
+            # 隐藏层的维度，即每层有多少个神经元。
+            # 在原始的 Transformer 论文（Attention Is All You Need）中，这个参数的名字就叫 $d_{model}$。
+            # 论文里为了写公式方便，定义了 $d_{model}$。在 Hugging Face 等代码库里，为了直观表达这是“隐藏层的大小”，
+            # 统一采用了 hidden_size 这个变量名。它们指的完全是同一个东西即 Embedding（嵌入层）的维度，
+            # 也是每一层 Transformer Block 输入和输出的向量维度。
             intermediate_size: int = None,
+            # 中间层的维度，即前馈网络的隐藏层维度。
+            # 在 Transformer 的每个 Block 中，数据经过 Self-Attention 后，
+            # 会进入一个 FFN（前馈神经网络） 层。这个过程通常是“先扩容，再压缩”。
+            # 输入维度是 $d_{model}$（你的 512）。
+            # 升维（中间层）维度扩充到 intermediate_size。
+            # 降维重新压回到 $d_{model}$（512）。
             max_position_embeddings: int = 32768,
+            # 最大位置嵌入长度，即输入序列的最大长度，或者说上下文的长度。
             num_attention_heads: int = 8,
+            # 注意力头数，即多头注意力机制中的头数。
             num_hidden_layers: int = 8,
+            # 隐藏层数，即模型有多少层。
+            # num_hidden_layers 指的就是 Transformer Decoder Block 的堆叠层数。
             num_key_value_heads: int = 2,
+            # 键值头数，即多头注意力机制中键和值的头数。
+            # 这是 GQA 中的参数。
             vocab_size: int = 6400,
+            # 词汇表大小，即模型能识别的单词数量。
             rms_norm_eps: float = 1e-05,
+            # RMSNorm 的一个超参数，用于数值稳定性。
             rope_theta: int = 1000000.0,
+            # 外推缩放参数，用于控制外推长度。
             inference_rope_scaling: bool = False,
+            # 是否使用外推缩放。
+            # 假设你的模型是在 2048 长度下训练的，现在你硬要它处理 32768 长度，直接跑肯定会“变傻”，因为它没见过那么大的位置编号。
+            # False： 按照常规逻辑推理。
+            # True： 启动 YaRN (Yet another RoPE extensioN) 等缩放算法。
+            # 它通过数学手段，把 32k 的位置信息“挤”到模型原本熟悉的 2k 范围内。
+            # 打个比方：本来一把尺子只有 20 厘米刻度，通过缩放，我们让模型认为这把尺子其实有 320 厘米，只不过每个刻度变密了。
             flash_attn: bool = True,
+            # 是否使用 FlashAttention。
             ####################################################
             # Here are the specific configurations of MOE
             # When use_moe is false, the following is invalid
             ####################################################
             use_moe: bool = False,
+            # 是否使用 MoE（Mixture of Experts）。
             num_experts_per_tok: int = 2,
+            # 每个 token 选择的专家数量。
+            # 对于每一个字（Token），模型会通过一个路由器（Router）从 4 个专家里选出 2 个 最合适的来干活。
             n_routed_experts: int = 4,
+            # 总的专家数量。
             n_shared_experts: int = 1,
+            # 共享专家
+            # 这是一个比较先进的设计（类似 DeepSeek）。无论路由怎么选，这个共享专家总是参与计算。它负责捕捉所有 Token 共有的通用知识，而路由专家负责捕获特定领域的知识。
             scoring_func: str = 'softmax',
+            # 评分函数，默认为'softmax'。
+            # 路由器给 4 个专家打分，用 softmax 把分数归一化到 0-1 之间，然后选分最高的。
             aux_loss_alpha: float = 0.01,
+            # 这是一个系数。如果专家之间任务分配不均，就会产生一个惩罚项（Loss）。这个值越大，模型就越努力地让每个专家都有活干。
             seq_aux: bool = True,
+            # 意味着在整个序列（Sequence）的维度上去平衡专家的负载，而不是只看单个位置。
             norm_topk_prob: bool = True,
+            # 假设选出的两个专家得分是 0.8 和 0.4，标准化后会让它们加起来等于 1（比如变成 0.67 和 0.33），从而保持信号强度的稳定。
             **kwargs
+            # 其他参数
     ):
         super().__init__(**kwargs)
         self.dropout = dropout
@@ -57,11 +110,17 @@ class MiniMindConfig(PretrainedConfig):
         # 外推长度 = factor * original_max_position_embeddings = 32768
         self.rope_scaling = {
             "beta_fast": 32,
+            # 对应高频部分。对于相邻很近的词，YaRN 认为不应该过度拉伸，否则模型会分不清谁是谁。
             "beta_slow": 1,
+            # 对应低频部分。对于跨度很大的长文本信息，YaRN 认为这部分应该多拉伸一些。
             "factor": 16,
+            # 这是缩放因子。因为 $32768 / 2048 = 16$。它告诉模型：我们要把位置编码的“尺子”拉长 16 倍。
             "original_max_position_embeddings": 2048,
+            # 这是模型训练时真实使用的最大长度基准。
             "attention_factor": 1.0,
-            "type": "yarn"
+            # 这是一个修正系数。当序列变长时，注意力分数（Attention Score）的熵会发生变化。
+            # 这个参数用来平衡注意力机制的能量，防止因为序列变长导致注意力变得过于集中或分散。
+            "type": "yarn" # 指定缩放算法的类型——yarn
         } if self.inference_rope_scaling else None
         self.flash_attn = flash_attn
         ####################################################
@@ -76,11 +135,6 @@ class MiniMindConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
-
-
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
-#                                             MiniMind Model
-# 📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘📘
 
 import math
 import torch
@@ -424,6 +478,7 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
+# 这里是核心部分。
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
 
