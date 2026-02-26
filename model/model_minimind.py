@@ -146,7 +146,7 @@ from typing import Optional, Tuple, List, Union
 from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
-
+# 规范化层
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
@@ -159,7 +159,7 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x):
         return self.weight * self._norm(x.float()).type_as(x)
 
-
+# RoPE 位置编码预计算
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
                          rope_scaling: Optional[dict] = None):
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
@@ -181,7 +181,7 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
 
-
+# 应用位置编码
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
@@ -190,7 +190,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
     return q_embed, k_embed
 
-
+# GQA 的键值复制
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, num_key_value_heads, head_dim = x.shape
@@ -200,7 +200,7 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
     )
 
-
+# 多头注意力（支持 FlashAttention）
 class Attention(nn.Module):
     def __init__(self, args: MiniMindConfig):
         super().__init__()
@@ -266,7 +266,7 @@ class Attention(nn.Module):
         output = self.resid_dropout(self.o_proj(output))
         return output, past_kv
 
-
+# 简单前馈网络
 class FeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -282,7 +282,7 @@ class FeedForward(nn.Module):
     def forward(self, x):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
-
+# 混合专家的路由门控
 class MoEGate(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -338,7 +338,7 @@ class MoEGate(nn.Module):
             aux_loss = scores.new_zeros(1).squeeze()
         return topk_idx, topk_weight, aux_loss
 
-
+# 混合专家前馈
 class MOEFeedForward(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -402,7 +402,7 @@ class MOEFeedForward(nn.Module):
 
         return expert_cache
 
-
+# 单个 Transformer Block
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
@@ -426,7 +426,7 @@ class MiniMindBlock(nn.Module):
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states, present_key_value
 
-
+# 堆叠所有块，生成隐层输出
 class MiniMindModel(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -478,7 +478,7 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
-# 这里是核心部分。
+# 这里是核心部分，因果语言模型头部，用于生成。
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
 
