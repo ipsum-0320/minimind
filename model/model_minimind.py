@@ -480,23 +480,63 @@ class MiniMindModel(nn.Module):
 
 # 这里是核心部分，因果语言模型头部，用于生成。
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    # 继承自 PreTrainedModel（处理模型加载、保存、权重初始化）和 GenerationMixin（赋予模型 .generate() 方法进行文本生成的能力）。
+
+    # PreTrainedModel 可以让我们不去写大量的样本代码，包括了：
+    # 序列化与加载 (save_pretrained / from_pretrained)。继承后，你可以直接通过 model.save_pretrained("./path") 保存模型，或者用 MiniMindForCausalLM.from_pretrained("repo_id") 从云端下载。它会自动处理权重转换、分片加载和版本校验。
+    # 权重初始化。它定义了 init_weights() 的标准流程。当你新建模型时，它能确保所有的 Linear 层、Embedding 层按照科学的高斯分布或 Xavier 分布初始化，而不是随机乱序。
+    # 设备管理。让你能轻松使用 .to("cuda")、.half()（半精度）或配合 accelerate 库进行分布式训练。
+
+    # GenerationMixin。forward 函数只负责计算一次前向传播，并不负责推理生成。
+    # 自动推理循环。文本生成是一个自回归过程（预测词 A -> 把 A 加入输入 -> 预测词 B）。继承 GenerationMixin 后，你就拥有了强大的 .generate() 方法。
+    # 内置高级搜索算法。你不需要自己写代码，就能直接使用Beam Search（束搜索）、Top-K / Top-P Sampling（核采样）、Temperature（温度调节）、阻止重复（Repetition Penalty）、KV Cache 管理。
+    # 它会自动处理 past_key_values 的传递，让生成速度提升数倍。
     config_class = MiniMindConfig
+    # 在 Hugging Face 的框架下，它是必须的。
+    # config_class：指定该模型使用的配置类，包含隐藏层维度、层数等超参数。
+    # 当你调用 from_pretrained 时，程序会先读取 config.json。通过这个声明，程序才知道该用 MiniMindConfig 这个类去解析这个 JSON 文件。
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        # 实例化模型的核心体。
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        # 线性层，将隐藏状态映射回词表大小（Vocab Size），用于预测下一个词。
         self.model.embed_tokens.weight = self.lm_head.weight
+        # 权重共享，最后一行将 Embedding 层的权重与输出层的权重设为同一个。这是一种常用的正则化手段，可以大幅减少模型参数量并提升效果。
 
+    # 这里的 forward 的函数即是训练代码又是推理代码。
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 labels: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+                # past_key_values = [
+                # --- 第一层 (Layer 0) ---
+                #     (
+                #         torch.randn(1, 4, 3, 8), # Key 张量: [Batch, Heads, Seq, Dim]
+                #         torch.randn(1, 4, 3, 8)  # Value 张量: [Batch, Heads, Seq, Dim]
+                #     ),
+                #     # --- 第二层 (Layer 1) ---
+                #     (
+                #         torch.randn(1, 4, 3, 8), # Key 张量
+                #         torch.randn(1, 4, 3, 8)  # Value 张量
+                #     )
+                # ]
+                # 当你生成第 4 个词（比如“他”）时，你会把这个结构传给模型。模型计算完后，会返回一个新的 past_key_values。新的数据结构依然是 List 包含 Tuple，但张量的形状会发生变化：
+                # 输入时：形状是 [1, 4, 3, 8]
+                # 输出时：形状变成了 [1, 4, 4, 8] （第 3 维从 3 变成了 4，因为多记了一个词）。
                 use_cache: bool = False,
                 logits_to_keep: Union[int, torch.Tensor] = 0,
                 **args):
+        # input_ids，输入的 Token 序列。
+        # attention_mask (注意力掩码)，用来告诉模型哪些 Token 是有效的，哪些是填充（Padding）出来的。
+        # labels (标签/目标)，torch.LongTensor，形状通常与 input_ids 相同。训练时专用。它包含了模型应该预测出的正确 Token。
+        # past_key_values (键值缓存 / KV Cache)，保存了之前推理步中每一层的 Key (K) 和 Value (V) 向量。
+        # use_cache (是否使用缓存)，一个开关，告诉模型是否需要返回 past_key_values。训练时为 True，推理时为 False。
+        # logits_to_keep (保留 Logits 的数量)，因为有一些 logits 是没有意义的。
+
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -504,15 +544,38 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args
         )
+        # hidden_states 是语义向量。
+        # past_key_values 是更新后的 KV Cache。
+        # aux_loss (辅助损失)，这通常出现在 MoE (Mixture of Experts，混合专家模型) 中。MoE 模型里有多个“专家”，如果大家都去挤同一个专家，模型效率会变低。aux_loss 就是用来平衡各专家负载的“罚款”。在 forward 的最后，这个 aux_loss 会加到总的 loss 里一起参与反向传播。
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # 根据 logits_to_keep 的值，确定我们要从模型提取出的深层特征（hidden_states）中截取哪一部分。
+        # 参数含义：slice(start, stop)。-logits_to_keep：从序列的末尾倒着数。None：表示直到序列的最后。
+        # 如果传入的是 tensor，那就是对不同的样本采取不同的抽取方式，这经常在训练模式中出现。
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        # 为什么要去裁剪呢？简单来说，裁剪（Slicing）是为了“只算有用的，省下没用的”。
+        # 从推理的角度来看，由于使用了 KV Cache（past_key_values），模型每一轮 forward 实际上只需要关注当前最新输入的那一个词。
+        # 如果不裁剪 lm_head 会计算这 2000 个词每一个词对应的 Logits（预测下一个词的分数）。但实际上，前 1999 个词对应的预测结果你根本不需要，因为它们已经是过去式了。
+        # 如果裁剪 (logits_to_keep=1)，通过 slice(-1, None)，模型只取最后一个特征向量喂给 lm_head。计算量骤降，速度提升，且节省了巨大的中间显存。
+
+        # 从训练的角度来看，在训练时，虽然我们要处理整个序列，但并不是所有位置的输出都对“学习”有贡献。
+        # 指令微调（SFT），通常我们会输入一个 Prompt（问题）和一个 Answer（回答）。在 SFT 中，我们通常只计算 Answer 部分的 Loss。因为问题是给定的，模型不需要学习如何生成问题。
+        # 假设序列总长 4000，其中问题 3500 词，回答 500 词。如果不裁剪，模型会生成一个 [Batch, 4000, 128000] 的巨型 Logits 张量。这在 FP32 精度下大约占用 2GB/样本。如果 Batch Size 是 8，光这一个变量就要 16GB 显存，直接导致显卡崩溃（OOM）。如果裁剪 (logits_to_keep=500)，通过 slice(-500, None)，模型只计算最后 500 个回答词的 Logits。
 
         loss = None
         if labels is not None:
             shift_logits = logits[..., :-1, :].contiguous()
             shift_labels = labels[..., 1:].contiguous()
+            # 进行错位。
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            # 计算交叉熵损失。
+            # 这是一个非常关键的约定。在数据预处理时，我们会把不需要计算 Loss 的部分（比如 Padding 或者 Prompt 部分）的标签设为 -100。
+            # Label 是不是 -100，就是决定模型“学不学习这个词”的唯一信号灯。
+            # 当 label 等于 -100 时，不管模型预测了什么（哪怕预测得离谱到天边），Loss 直接记为 0。模型不会因为这个词的预测好坏而产生任何权重更新。
+            # 给 label 赋值为 -100 的时机，主要集中在**“数据喂给模型前的最后一刻”**。在实际的大模型开发中，这通常发生在 Dataset（数据集类） 或 Data Collator（数据整理器）中。
 
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
+        # CausalLMOutputWithPast 是 Hugging Face transformers 库定义的一个标准数据类（Dataclass）。
+        # 如果返回 (loss, logits, ...)，你必须死记硬背顺序（第 0 位是 Loss，第 1 位是 Logits）。而使用了这个对象后，调用者可以通过属性名直接访问，代码可读性极高。
+        # 除了装入 loss、logits、past_key_values 和 hidden_states 以外，还把 MoE 的 aux_loss 也装进去了。
         output.aux_loss = aux_loss
         return output
