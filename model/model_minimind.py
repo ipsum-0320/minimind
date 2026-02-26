@@ -160,25 +160,48 @@ class RMSNorm(torch.nn.Module):
         return self.weight * self._norm(x.float()).type_as(x)
 
 # RoPE 位置编码预计算
+# 这段代码不仅是给每个词打上“位置标签”，它还是一套动态调整方案：
+# - 短文本：按标准 RoPE 运行。
+# - 长文本：激活 YaRN 逻辑，通过修改频率分布（ramp）和缩放注意力（attn_factor），让模型在不重新训练的情况下，看懂比以前更长的文章。
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6,
                          rope_scaling: Optional[dict] = None):
+    # 这段代码是 RoPE（旋转位置嵌入） 的核心实现，并且集成了 YaRN (Yet another RoPE extension method) 策略。
+    # 为模型生成一套“刻度尺”，让模型知道 Token 之间的相对距离，同时通过 YaRN 技术让模型能够处理比训练时更长的文本。
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
     if rope_scaling is not None:
+        # 如果提供了 rope_scaling，说明模型想要支持长文本外推。
+        # 提取 YaRN 相关的超参数
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
-            rope_scaling.get("beta_fast", 32.0), rope_scaling.get("beta_slow", 1.0), rope_scaling.get("attention_factor", 1.0)
+            rope_scaling.get("beta_fast", 32.0), 
+            rope_scaling.get("beta_slow", 1.0), 
+            rope_scaling.get("attention_factor", 1.0)
         )
         if end / orig_max > 1.0:
             # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
+            # 如果当前请求的长度超过了原始训练长度
+            # 不仅仅是简单地压缩频率（Linear Scaling），而是根据维度的高低，对不同频段进行不通程度的“拉伸”。
             inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            # 计算 YaRN 的边界。
+            # 由于 RoPE 不同维度的震荡频率不同，YaRN 定义了：
+            # - 高频部分（低维度）：不改变，保留精确的相对位置感。
+            # - 低频部分（高维度）：进行全量的插值（除以 factor）。
+            # - 中间部分：通过 ramp 线性过渡。
             ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
             freqs = freqs * (1 - ramp + ramp / factor)
+            # 生成一个渐变系数 ramp。根据这个系数调整 freqs。低频维度被压缩（除以 factor），从而在有限的旋转范围内装下更长的序列。
+
 
     t = torch.arange(end, device=freqs.device)
+    # 生成 [0, 1, 2, ..., end-1] 的时间步
     freqs = torch.outer(t, freqs).float()
+    # # 计算外积，得到 (sequence_length, dim//2) 的相位矩阵
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    # 计算 $\cos$ 和 $\sin$。
+    # torch.cat: 将矩阵在最后一个维度复制一遍（拼接）。这是为了后续能直接与词向量进行点乘和按位相乘（常用技巧是 $[x, y] \rightarrow [x \cos - y \sin, y \cos + x \sin]$）。
+    # attn_factor: YaRN 引入的缩放因子，用于在长文本扩展后修正注意力得分的熵，防止模型注意力变得涣散。
     return freqs_cos, freqs_sin
 
 # 应用位置编码
@@ -434,48 +457,179 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
+        # 定义 Dropout 层。在训练过程中随机丢弃一部分神经元，防止模型过拟合。
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+        # 使用 ModuleList 构建层级堆叠。这里会循环创建 num_hidden_layers 个 MiniMindBlock（通常包含自注意力机制和全连接层）。
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 这里的 RMSNorm 也是一个 nn.Module。
+        # 定义最终归一化层。这里使用的是 RMSNorm（均方根归一化），这在现代 Transformer 模型（如 Llama）中非常常见，用于稳定最后一层的输出。
 
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.hidden_size // config.num_attention_heads,
                                                     end=config.max_position_embeddings, rope_base=config.rope_theta,
                                                     rope_scaling=config.rope_scaling)
+        # 调用函数预先计算 RoPE（旋转位置嵌入） 所需的正弦（sin）和余弦（cos）频率矩阵。
+        # dim: 每个注意力头的维度。
+        # end: 最大序列长度（max_position_embeddings）。
+        # rope_theta: 控制旋转频率的底数（通常是一个很大的数，如 10000）。
+
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
+        # 将计算好的频率矩阵注册为模型的 Buffer。为什么要做这样做？
+        # 非参数化: Buffer 里的数据不属于模型参数，不会计算梯度，也就不会被更新。
+        # 设备同步: 它们会随模型一起移动到 GPU 或 CPU，无需手动搬运。
+        # persistent=False: 表示这些缓存不需要保存在模型的 state_dict（权重文件）中，因为它们每次启动时都可以重新计算出来。
+
+        # freqs_cos 和 freqs_sin 的维度是 (max_seq_len, head_dim)。
+        # max_seq_len 是模型支持的最大序列长度（例如 2048 或 32768）。
+        # head_dim 是每个注意力头的维度（注意：不是整个模型的 hidden_size，而是 hidden_size / num_attention_heads）。
+
+        # 假设 Head_Dim = 128：
+        # freqs_cos[10, 0]：代表第 10 个词在第 0 个维度上的旋转余弦值（变化最快）。
+        # freqs_cos[10, 63]：代表第 10 个词在第 63 个维度（前半截的最后一位）上的旋转余弦值（变化最慢）。
+        # freqs_cos[10, 64]：数值等于 freqs_cos[10, 0]（因为是 cat 出来的副本）。
 
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
+                # input_ids: 词向量索引，形状通常为 [batch_size, seq_length]。
                 attention_mask: Optional[torch.Tensor] = None,
                 past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
                 use_cache: bool = False,
+                # past_key_values: 用于推理加速的 KV Cache（缓存的键值对）。
+                # use_cache: 是否返回当前的 KV 缓存以供下一次推理使用。
                 **kwargs):
         batch_size, seq_length = input_ids.shape
-        if hasattr(past_key_values, 'layers'): past_key_values = None
+
+        if hasattr(past_key_values, 'layers'): 
+            past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
+        # 确保 past_key_values 是一个可迭代的列表。如果传入的是空或旧格式，则初始化为每层对应的 None 列表
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        # 计算当前输入的起始位置。如果是增量推理（生成模式），start_pos 就是之前生成的 Token 数量；如果是首次计算，则为 0。
+        # 这里的 past_key_values 如下所示：
+        # past_key_values = [
+        # --- 第一层 (Layer 0) ---
+        #     (
+        #         torch.randn(1, 4, 3, 8), # Key 张量: [Batch, Heads, Seq, Dim]
+        #         torch.randn(1, 4, 3, 8)  # Value 张量: [Batch, Heads, Seq, Dim]
+        #     ),
+        #     # --- 第二层 (Layer 1) ---
+        #     (
+        #         torch.randn(1, 4, 3, 8), # Key 张量
+        #         torch.randn(1, 4, 3, 8)  # Value 张量
+        #     )
+        # ]
 
         hidden_states = self.dropout(self.embed_tokens(input_ids))
+        # 将整数形式的 input_ids 映射为稠密的向量（Embedding），并应用 Dropout（如果配置了的话）来防止过拟合。
+        # 哪些层会调用 self.dropout？
+        # 在一个完整的 Transformer 架构中，Dropout 通常会出现在以下三个关键位置：
+        # 1. Embedding Dropout。在词向量叠加位置编码后执行（即你代码中的位置），防止模型过度依赖某些特定的词维度。
+        # 2. Attention Dropout。在计算 Attention Score（$Softmax$ 之后）执行，随机让某些注意力权重失效，防止模型只关注局部特征。
+        # 3. Residual Dropout。在每个子层（Attention 或 MLP）的输出加回残差连接之前执行，这是最常用的正则化手段。
+        # 现代大模型（如 Llama 3）为了训练稳定性，往往会减少甚至移除这些 Dropout，转而依赖更大的数据量和更强的正则化手段（如权重衰减）。
+
+        # 两者都试图解决同一个问题：防止模型对训练数据中的特定路径产生过度依赖。
+        # Weight Decay 说：“我不准任何一个权重 $w$ 变得太大。如果某个 $w$ 太大，说明模型在强行拟合某个特征，这很危险。”
+        # Dropout 说：“我不准模型依赖任何一组特定的神经元。我随机关掉一些，强迫剩下的神经元也能把活干好。”
+        # 带 Dropout 的神经网络，在数学上等价于一种特殊的贝叶斯近似（高斯过程），而这种近似包含了一个隐性的正则化项（类似于 L2 正则化）。
 
         position_embeddings = (
             self.freqs_cos[start_pos:start_pos + seq_length],
             self.freqs_sin[start_pos:start_pos + seq_length]
         )
+        # 这两行代码是在为模型准备 RoPE（Rotary Positional Embedding，旋转位置编码） 所需的旋转矩阵参数。
+        # self.freqs_cos / self.freqs_sin 是模型初始化时预先计算好的两张大表。它们存储了不同位置（从 0 到最大序列长度）对应的正弦（Sin）和余弦（Cos）频率值。
+        # start_pos : start_pos + seq_length 是切片操作。
+        # 如果是预填充阶段（Prefill）：一次性输入 10 个词，start_pos=0，seq_length=10，它会取出前 10 组旋转参数。
+        # 如果是生成阶段（Decoding）：每次只输入 1 个新词。如果之前已经生成了 100 个词，那么 start_pos=100，seq_length=1，它只取出第 101 个位置对应的旋转参数。
+
+        # 什么是预填充阶段？
+        # LLM 是基于 Attention 机制的。要生成第 $N+1$ 个字，模型必须知道前 $N$ 个字的所有信息。计算用户输入的 Prompt 中所有 Token 的 Internal States，生成 KV Cache。模型会将 Prompt 中每个词的 Key 和 Value 存起来，这样后续生成新词时，就不需要重新计算旧词了。
 
         presents = []
         for layer_idx, (layer, past_key_value) in enumerate(zip(self.layers, past_key_values)):
+            # self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
+            # layers 就是 MiniMindBlock。
+            # past_key_values 是每一层的 KV Cache。
+            # 为什么每一层的 KV Cache 会不一样呢？
+            # KV Cache 存储的确实是乘积，但它是「输入 $X$」与「$W_K, W_V$ 权重」的乘积，而不是「输出 $X$」。
+            # 本质上 KV Cache 不一样是因为每一层都有独立的 QKV 权重矩阵。
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
+                # 在标准的模型训练阶段，确实不需要传入 past_key_values。
+                # 这里是为推理阶段做的兼容。
                 use_cache=use_cache,
+                # 训练阶段，use_cache 是 False。
                 attention_mask=attention_mask
             )
             presents.append(present)
+            # 在推理（Inference）阶段，present 就是在 past_key_value 的基础上，“追加”了当前这个时间步（Current Token）新产生的 $K$ 和 $V$。
+            # 在训练阶段，此处的 KVCache 是没有意义的。
+            # 这里就是在存储 KV Cache。
+
+            # 下面这里简单去介绍一下 GQA。
+            # 我们已经理解了 KV Cache 是存储每一层的 $K$ 和 $V$ 矩阵，那么理解 GQA (Grouped-Query Attention) 就非常简单了：GQA 的本质就是为了给 KV Cache “瘦身”。
+            # 首先我们回顾一下 past_key_value 长什么样子，如下所示：
+            # past_key_values = [
+            # --- 第一层 (Layer 0) ---
+            #     (
+            #         torch.randn(1, 4, 3, 8), # Key 张量: [Batch, Heads, Seq, Dim]
+            #         torch.randn(1, 4, 3, 8)  # Value 张量: [Batch, Heads, Seq, Dim]
+            #     ),
+            #     # --- 第二层 (Layer 1) ---
+            #     (
+            #         torch.randn(1, 4, 3, 8), # Key 张量
+            #         torch.randn(1, 4, 3, 8)  # Value 张量
+            #     )
+            # ]
+            # 在 LLM 推理中，显存瓶颈通常不在模型权重，而在不断增长的 KV Cache。GQA 正是目前 Llama 3、Mistral、DeepSeek 等主流模型采用的最优解。
+            # 传统的 MHA (Multi-Head Attention) 中每个 Query Head ($Q$) 都有自己专属的一个 Key Head ($K$) 和 Value Head ($V$)。
+            # KV Cache 体积 == $2 \times \text{层数} \times \text{头数} \times \text{序列长度} \times \text{每个头的维度}$。
+            # 问题是随着生成长度增加，KV Cache 会迅速吃光显存，导致 Batch Size 提不上去，推理变慢。
+            # 从底层实现来看，GQA 本质就是在减少 W K 和 W V 这两个权重矩阵的参数量。之前是 (d_model, n * d_head)，GQA 变成了 (d_model, g * d_head)，MQA 变成了 (d_model, 1 * d_head)。权重矩阵的形状改变是 GQA/MQA 的物质基础。
+            # 采用了 GQA 之后，上面的 KV Cache 示例变成了如下所示：
+            # 假设 GQA 分组配置：num_query_heads=4, num_kv_heads=2 (即 2 个 Q 共享 1 个 KV)
+            # past_key_values = [
+            #     # --- 第一层 (Layer 0) ---
+            #     (
+            #         # Key 张量: [Batch, KV_Heads, Seq, Dim] 
+            #         # 注意：Heads 从 4 变成了 2
+            #         torch.randn(1, 2, 3, 8), 
+            #         # Value 张量: [Batch, KV_Heads, Seq, Dim]
+            #         torch.randn(1, 2, 3, 8)  
+            #     ),
+            #     # --- 第二层 (Layer 1) ---
+            #     (
+            #         # 同理，KV 的头数被压缩了
+            #         torch.randn(1, 2, 3, 8), 
+            #         torch.randn(1, 2, 3, 8)
+            #     )
+            # ]
 
         hidden_states = self.norm(hidden_states)
+        # 在标准的 Transformer 架构（尤其是 Pre-norm 架构，如 Llama、GPT）中，每一层的输入都会先经过 Norm，但最后一层的输出在送入最后的线性层（LM Head）预测单词之前，必须再经过一次总的归一化。
+        # 将经过了数十层叠加、数值可能已经变得很大或分布偏移的 hidden_states 重新拉回到一个稳定的均值和方差。这个 norm 通常是 RMSNorm。完成这一步后，hidden_states 就可以直接用来计算下一个词的概率了。
 
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
+        # 这一行是针对 MoE（Mixture of Experts，混合专家模型） 的特殊逻辑，非常关键。
+        # 在 MoE 架构（如 DeepSeek, Mixtral）中，每一层都有多个“专家”（MLP）。模型会自动学习将 Token 交给最合适的专家处理。
+        # 问题是如果不加干预，模型往往会产生“胜者全拿”效应——即只训练极少数几个表现好的专家，而其他专家处于“失业”状态。这会导致模型参数浪费，且容易过拟合。
+        # 为此我们引入了 Auxiliary Loss（辅助损失），强制模型在训练时尽可能均匀地分配任务给所有专家。
+        # 下面来详细拆解下代码实现：
+        # [l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)]
+        # 它遍历模型的所有层，只对那些 MLP 层确实是 MOEFeedForward（即 MoE 结构）的层进行操作，从每一层取出该层计算出的 aux_loss（这个值通常在层的前向传播中根据 Token 的分发策略自动算出）。
+        # sum(..., hidden_states.new_zeros(1).squeeze())
+        # 将所有层的辅助损失相加，得到整个模型的总辅助损失。
+        # hidden_states.new_zeros(1).squeeze()：这是一个编程技巧。它创建了一个初始值为 0 的标量张量，其设备（CPU/GPU）和数据类型（FP16/BF16）自动与 hidden_states 保持一致，确保加法运算不会报错。
+        # hidden_states.new_zeros(1) 含义是请参照 hidden_states 这个张量，帮我创建一个形状为 (1,) 的全 0 张量。
+        # new_zeros(1) 产生的是一个一维向量，形状是 [1]。.squeeze() 会把所有长度为 1 的维度删掉，把它变成一个标量（Scalar）
         return hidden_states, presents, aux_loss
+        # 最后，函数返回了三个核心产物：
+        # hidden_states：最终的特征表示（用于预测单词）。
+        # presents：更新后的全量 KV Cache（用于下一轮推理）。
+        # aux_loss：MoE 系统的“公平性”指标。
 
 
 # 这里是核心部分，因果语言模型头部，用于生成。
