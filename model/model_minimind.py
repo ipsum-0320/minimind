@@ -425,29 +425,58 @@ class MOEFeedForward(nn.Module):
 
         return expert_cache
 
-# 单个 Transformer Block
+# 单个 Transformer Decoder Block
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.num_attention_heads = config.num_attention_heads
+        # 从配置中读取多头注意力的头数
         self.hidden_size = config.hidden_size
+        # 隐藏层维度（例如 512 或 1024）
         self.head_dim = config.hidden_size // config.num_attention_heads
+        # 计算每个注意力头的维度（总维度 / 头数）
         self.self_attn = Attention(config)
+        # 实例化注意力层（模型用来理解上下文的核心组件）
 
         self.layer_id = layer_id
+        # 保存这一层在整个模型中的序号（比如第 5 层）。
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 实例化第一个归一化层（在进入注意力机制前使用），RMSNorm 是一种比 LayerNorm 更高效的变体
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 实例化第二个归一化层（在进入全连接层前使用）
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        # 实例化全连接层（MLP）。如果配置里启用了 MoE（混合专家模型），就用 MOEFeedForward，否则用普通 FeedForward。
+        # 如果采用了 FeedForward，那么就是 Dense 模型，例如 GPT-3、Llama-2。
+        # 如果模型中引入了 MOEFeedForward，它就变成了 MoE（混合专家）模型。
+
+        # 选 Dense：如果你追求部署极其简单、显存资源有限，或者模型规模在 7B 以下。在小参数量级下，MoE 的路由开销和训练复杂度可能并不划算。而且 Dense 模型的训练稳定性比较高，且由于参数总量通常比 MoE 小，对显存总量的要求更低。
+
+        # 选 MoE：如果你想做 SOTA（业界领先） 效果，且有足够的存储资源。MoE 允许你在保持 10B 级别推理速度的同时，拥有 50B 甚至 100B 级别的知识储备（Knowledge Capacity）。此外，不同的专家可以专注于不同的领域（如逻辑推理、创意写作、代码）。这种分工理论上能比同等计算量的 Dense 模型达到更高的上限。
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
+        # 将输入的 hidden_states（通常称为“隐藏状态”或“特征向量”）备份一份。
+        # 为了实现残差连接（Residual Connection）。在经过复杂的注意力计算后，我们会把原始输入加回来，这有助于缓解深层网络中的梯度消失问题，让模型更容易训练。
         hidden_states, present_key_value = self.self_attn(
             self.input_layernorm(hidden_states), position_embeddings,
             past_key_value, use_cache, attention_mask
         )
+        # 先对输入进行归一化（Layer Norm）。因为是 Pre-Norm 结构，归一化发生在计算注意力之前，这能让模型训练更稳定。
+        # self.self_attn(...)：执行自注意力机制（Self-Attention）。
+        # - position_embeddings：注入位置信息（如 RoPE 旋转位置编码）。
+        # - past_key_value & use_cache：用于推理加速的 KV Cache 机制。
+        # - attention_mask：确保模型不会“偷看”未来的 Token。
+        # self.self_attn() 的返回值是处理后的特征 hidden_states 以及更新后的 present_key_value（用于下一轮推理的缓存）。
         hidden_states += residual
+        # 添加残差。
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        # self.mlp(self.post_attention_layernorm(...)) 先对上一步的结果做第二次归一化（post_attention_layernorm），和 Attention 一样都是 Pre-Norm。
+        # 送入 MLP（多层感知机）。MLP 负责对每个位置的特征进行非线性变换，提取更深层次的信息。
+        # hidden_states + ... 代表再次应用残差连接，将 MLP 的输出与进入 MLP 之前的 hidden_states 相加。
         return hidden_states, present_key_value
+        # hidden_states 是本层处理完的特征，将作为下一层 Transformer Block 的输入。
+        # present_key_value 是当前层的 KV 缓存，返回给模型顶层以便在生成下一个 Token 时重复使用。
 
 # 堆叠所有块，生成隐层输出
 class MiniMindModel(nn.Module):
