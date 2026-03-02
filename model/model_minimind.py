@@ -363,6 +363,7 @@ class MoEGate(nn.Module):
 
 # 混合专家前馈
 class MOEFeedForward(nn.Module):
+    # 这段代码实现了一个经典的混合专家模型（Mixture of Experts, MoE） 前馈网络层。这种结构的核心思想是不让一个巨大的神经网络处理所有信息，而是将其拆分为多个“专家”，由“门控系统”决定哪些专家该出来干活。
     def __init__(self, config: MiniMindConfig):
         super().__init__()
         self.config = config
@@ -370,60 +371,267 @@ class MOEFeedForward(nn.Module):
             FeedForward(config)
             for _ in range(config.n_routed_experts)
         ])
+        # nn.ModuleList 是一个特殊的列表，用于存储 PyTorch 子模块。如果你用普通的 Python list，PyTorch 就找不到里面的参数，导致无法训练。
+        # experts 就是一个个的 FeedForward。每一个“专家”本质上就是一个标准的前馈神经网络（通常是两层全连接加一个激活函数）。
+        # config.n_routed_experts 通过循环创建了指定数量的专家（例如 8 个或 16 个）。这些专家被称为“被路由的”，因为输入数据会根据权重选择性地进入其中的某几个。
         self.gate = MoEGate(config)
+        # MoEGate 是 MoE 的“大脑”，它的作用是接收输入向量，计算出一组权重，决定当前的输入应该送给 self.experts 中的哪几个专家处理。
+        # 通常它会输出一个稀疏向量，例如对于某个 token，专家 A 的权重是 0.9，专家 B 是 0.1，其余全是 0。
         if config.n_shared_experts > 0:
+            # if config.n_shared_experts > 0 是一个条件判断。有些 MoE 设计（如 DeepSeek）会包含“共享专家”。
+            # 共享专家和路由专家。
+            # 路由专家只有被选中的才干活（节省计算量）。
+            # 共享专家无论输入是什么，它们总是参与计算。
+            # 这样做通常是为了捕捉所有数据通用的基础知识，防止模型在切换专家时丢失核心语义。
             self.shared_experts = nn.ModuleList([
                 FeedForward(config)
                 for _ in range(config.n_shared_experts)
             ])
 
     def forward(self, x):
+        # 这段代码展示了 MoE（混合专家模型）最核心的 forward（前向传播） 逻辑，它决定了输入数据如何被分发给不同的专家，以及如何将结果合并。
         identity = x
+        # identity 会备份原始输入。如果后面有“共享专家”，它们会直接作用于这个原始输入。
         orig_shape = x.shape
+        # 备份 orig_shape。
         bsz, seq_len, _ = x.shape
         # 使用门控机制选择专家
         topk_idx, topk_weight, aux_loss = self.gate(x)
+        # 门控网络计算。
+        # 1. topk_idx: 每个 token 选中的前 $k$ 个专家的索引。
+        # 2. topk_weight: 对应专家的权重（通常是经过 Softmax 的）。这里的 topk_weight 的形状为 (x, 1-x)，这代表选择两个专家，第一个专家概率为 x，第二个专家概率为 1 - x。
+        # 3. aux_loss: 辅助损失（用于平衡专家，防止某些专家“太忙”而另一些“太闲”）。
         x = x.view(-1, x.shape[-1])
+        # x.view(-1, ...) 将输入展平为 (总 token 数, 隐藏维度)，方便统一处理。
         flat_topk_idx = topk_idx.view(-1)
+        # 假设我的输入数据如下。Batch Size (bsz) = 2 （有两个句子）、Sequence Length (seq_len) = 3 （每句话有 3 个词/token）、Top-k = 2 （每个 token 选 2 个专家）。
+        # 此时，topk_idx 的原始形状是 (2, 3, 2)。它看起来像这样：
+        # [
+        # [[专家1, 专家3], [专家2, 专家1], [专家4, 专家2]], # 句子1的三个词选的专家
+        # [[专家3, 专家4], [专家1, 专家2], [专家3, 专家2]]  # 句子2的三个词选的专家
+        # ]
+        # 执行 flat_topk_idx = topk_idx.view(-1) 后，它变成了一个长度为 $2 \times 3 \times 2 = 12$ 的一维长条。
+        # [专家1, 专家3, 专家2, 专家1, 专家4, 专家2, 专家3, 专家4, 专家1, 专家2, 专家3, 专家2]
         if self.training:
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
+            # torch.repeat_interleave 的作用是对张量中的元素进行“就地连续重复”
+            # 假设你有一排人 [A, B, C]。普通的 repeat(2)（整体复制）结果是 [A, B, C, A, B, C]（排两次队）。repeat_interleave(2)（就地重复）结果是 [A, A, B, B, C, C] （每个人原地变出个双胞胎）。
+            # 这里为什么要执行 repeat_interleave？
+            # 任务分配，如果每个 Token 要交给 2 个专家（top-2），那么每个 Token 必须有 2 份实体。
+            # 索引对齐，x 经过重复后变成了：[T1, T1, T2, T2, T3, T3, ...]，而我们的 flat_topk_idx（拉平后的专家索引）也是 [专A, 专B, 专C, 专D, ...] 这样第 0 个的 T1 对应的就是 专A，第 1 个的 T1 对应的就是 专B。
+            # 如果没有这一步，你的数据量（Token 数）就对不上专家索引的数量（Token 数 $\times$ k），程序就会因为维度不匹配直接报错。
             y = torch.empty_like(x, dtype=x.dtype)
+            # 创建一个与输入张量 x 形状、设备（CPU/GPU）完全一致的“空容器”，用来存放专家们计算出来的结果。
             for i, expert in enumerate(self.experts):
+                # 遍历每一个专家。i 是专家的编号（比如 0 到 7），expert 是对应的那个前馈网络（FeedForward）层。
                 expert_out = expert(x[flat_topk_idx == i])
-                if expert_out.shape[0] > 0: y[flat_topk_idx == i] = expert_out.to(y.dtype)
-                else: y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters())
+                # 这是一个布尔索引（Boolean Indexing）操作。
+                # 假设 flat_topk_idx 是 [0, 2, 0, 1, 2, 0]（表示 6 个任务对应的专家编号）。当循环运行到 i = 0 时 flat_topk_idx == 0 会得到 [True, False, True, False, False, True]。
+                # 这个布尔列表就像一张名单，告诉程序——第 0、2、5 个位置的任务归专家 0 管。
+                # x 为 [T1, T1, T2, T2, T3, T3, ...]。
+                # flat_topk_idx 为 [专A, 专B, 专C, 专D, ...]。
+                # x[flat_topk_idx == i] 会根据上面的名单，从巨大的 x（包含所有 Token 副本）中，只把那 3 个 True 对应的数据行抽出来。
+                # 因此就是 T1、T2、T3 去 expert 0。专家 $i$ 只需要处理属于它的那部分数据。
+                # 现在，专家 $i$ 拿到的不再是全量数据，而是一个变小了的张量。那么 expert(x[...]) 这一步，专家 0 的全连接层就只对这 125 条数据进行矩阵乘法。这就是 MoE 快的秘密——每个专家只负担总工作量的一小部分（约为 $1/N$）。
+                
+                # 现在有一个问题是，这似乎并没有让 MoE 比 Dense 更快，因为每个 token 还是要过一个 FFN。
+                # 但其实我们要知道，一般情况同等规模的参数下，Dense 里面的 FFN 的大小和 MoE 里面的 FFN 的大小是不一样大的。
+                # 如果我们希望 MoE 的总参数量（所有专家加起来）等于一个 Dense 模型，那么每个专家必须比 Dense FFN 小得多。
+                # 假设 dense 模型的参数权重是 (4096, 16384)，那么 8 专家的 MoE 的 FFN 参数权重则是 (4096, 2048)。
+
+                # 因此，从这个角度来看，MoE 模型的推理速度是要显著高于 Dense 模型的。对于同一个 Token 来说，在 FFN 层，MoE 前向传播激活的参数只有 Dense 前向传播的 1/n。
+                # 虽然我们看到的这段代码用了 for 循环（这在单卡上确实不快），但在大规模分布式训练中，不同的专家会被分发到不同的 GPU 上（例如 GroupedGemm）。
+                # 比如 GPU 0 只算专家 1，GPU 1 只算专家 2。
+                # 通过 x[flat_topk_idx == i] 过滤后的数据被发送到对应的 GPU。由于每个专家拿到的数据变少了，单卡的计算延迟降低了，大家同时前向传播，整体吞吐量（Throughput）大幅提升。
+                
+                # 当然，需要明确的是，目前大模型的主流做法，每个专家的大小其实和 Dense FFN 是一样大的。
+                # Dense 模型 (如 Mistral 7B)：FFN 维度是 14336。
+                # MoE 模型 (如 Mixtral 8x7B)：它有 8 个专家，每个专家的 FFN 维度依然是 14336。
+                # 从计算成本角度看，虽然总参数量达到了 47B，但每个 Token 只选 2 个专家计算，所以它的计算量只相当于一个 12B 左右的 Dense 模型。
+                # 结果是你用 12B 的推理速度，获得了一个接近 50B 规模模型的智商。
+                if expert_out.shape[0] > 0: 
+                    # expert_out 是动态的，因为每个专家被分到的 token 数会变化，假设分到的 token 数是 M 个，那么 expert_out 的形状就是 (M, 4096)，也就是普通 ffn 的输出结果。
+                    # expert_out.shape[0] > 0 就代表 M > 0，也就是分到了一个 token。
+                    # 在这种情况下，需要把专家计算出的结果 expert_out 填回到大容器 y 的对应位置。
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype)
+                    # 这是布尔索引，同样的，y[flat_topk_idx == 0] 就像是一把精准的镊子，只夹住了 y 中的第 0、3、4 行。
+                    # 这行代码成立的前提是等号左边的“空位”数量，必须等于等号右边的“数据”数量。
+                    # 左边 y[mask]：从全局容器中选出了 $M$ 个位置（即分配给专家 $i$ 的工位）。右边 expert_out：专家 $i$ 刚刚算好的 $M$ 条结果。
+                    # 这是一个完美的 1:1 填充。 虽然在 expert_out 内部，这些 Token 是紧挨着排列的（第 0, 1, 2 行），但赋值操作会自动按照 Mask，把它们散开填回到 y 的第 0, 3, 4 行。
+                else: 
+                    # 如果该专家没有被分到任何的 token。
+                    # 在 MoE 模型中，门控系统（Gate）是动态的。在某一次训练迭代中，可能会出现“某个专家一个 Token 也没分到”的情况（即 expert_out 的行数为 0）。
+                    # 在分布式训练（Distributed Data Parallel, DDP）下，这会引发致命错误。DDP 的工作原理是它要求所有 GPU 在每一轮结束时，同步所有参数的梯度。
+                    # 如果专家 i 没分到 Token，它的参数就没有参与计算，梯度就是 None。当 DDP 试图同步这个专家的梯度时，发现有些 GPU 有梯度，有些没有（None），程序就会直接崩溃或挂起。
+                    y[flat_topk_idx == i] = expert_out.to(y.dtype) + 0 * sum(p.sum() for p in expert.parameters()) # p.sum() 返回的是一个 tensor。
+                    # 这一行代码通过一个无效但合法的运算，给 PyTorch 的 Autograd（自动求导引擎）开了一张“假条”。
+                    # sum(p.sum() for p in expert.parameters()) 强行遍历了专家 i 的每一个参数（权重和偏置），并把它们加在一起算出一个总和。这意味着，在计算图里，专家 i 的参数被“激活”了，它们和当前的输出变量 y 建立起了逻辑连接。
+                    # 然后我们将这个总和乘以 0。无论参数是多少，结果永远是 0。对 y 的影响 => expert_out + 0 依然等于 expert_out。数据本身没有受到任何污染。
+                    # 通过这个操作，PyTorch 会认为专家 i 参与了计算。在反向传播时，会为专家 i 的参数计算梯度。虽然算出来的梯度值是 0（因为乘了 0），但它是一个实实在在的 “0”，而不是 “None”。
+                    # 最后，DDP 看到梯度是 0，愉快地完成了同步，训练继续进行，不会报错。
+
+                    # 为什么这里的 expert 的梯度是 None 呢？和计算图有关吗？
+                    # 是的，这就是由于 MoE 稀疏选择特性导致的计算图断裂。
+                    # 那么，在什么情况下我们可以说某一个参数被纳入到了计算图之中？
+                    # 简单来说，当一个参数（Leaf Tensor）参与的任何数学运算，其结果最终被用来计算 Loss（标量）时，我们就说这个参数被纳入了计算图。我们一般可以通过下面的代码来判断某个参数是否还在计算图中，如下所示：
+                    # output = expert(input)
+                    # print(output.grad_fn)
+                    # 如果输出类似 <AddBackward0...>, 说明它在图中。如果输出 None, 说明它是一个孤立的叶子节点，断路了。
+                    # 以下几种常见情况，即使你写了代码，参数也没有进入计算图：
+                    # 1. 脱离张量操作。y = x + expert.weight.item()，.item()提取了 Python 数值，丢失了所有梯度跟踪信息。
+                    # 2. 原地/非跟踪赋值。with torch.no_grad(): y = expert(x)，明确告诉框架不要记录这一段的操作。
+                    # 3. 索引为空。y[False] = expert(x)，赋值操作未发生，专家参数与 y 之间没有建立逻辑指针。
+                    # 4. 未参与 Loss 计算。y = expert(x); Loss = other_y.sum()，虽然算了专家，但结果没进 Loss，这条支路在反向传播时会被忽略。
+
+                    # 所以，只要某个参数通过任意一种计算对最后的 loss 有贡献，那么我们就说这个参数被纳入到了计算图之中。
             y = (y.view(*topk_weight.shape, -1) * topk_weight.unsqueeze(-1)).sum(dim=1)
+            # 在整个 LLM 的 Decoder-only 架构中，y 的 size 和 x 的 size 是始终保持一致的。
+            # 给出超参数假设来读懂这一段代码，假设 Token 数量 1 个（为了简化，假设 Batch=1, Seq_len=1），Top-K 2（每个 Token 选 2 个专家），隐藏层维度 (Hidden Size)是 3 维。y 如下：
+            # [
+            #   [1.0, 1.0, 1.0],  # 专家 A 的输出
+            #   [2.0, 2.0, 2.0]   # 专家 B 的输出
+            # ]
+            # 那么 topk_weight 就是 [[0.7, 0.3]]（因为只有一个 token 选择两个专家）。
+            # 这里的 *topk_weight.shape 是在参数解包，将原来的 (1, 2) 解包成两个数据，1 和 2。
+            # y 原来是 (2, 3) 现在变成 (1, 2 ,3)
+            # topk_weight.unsqueeze(-1) 把权重从 (1, 2) 变成 (1, 2, 1)，这是为了让权重能跟 3 维的专家输出做乘法（广播机制）。
+            # 之后的 * 操作就是专家输出 * 对应的权重，如下所示：
+            # [
+            # [ 
+            #     [1.0*0.7, 1.0*0.7, 1.0*0.7], # 专家 A 乘权重
+            #     [2.0*0.3, 2.0*0.3, 2.0*0.3]  # 专家 B 乘权重
+            # ]
+            # ]
+            # # 得到：
+            # [[ [0.7, 0.7, 0.7], [0.6, 0.6, 0.6] ]]
+            # 最后的 .sum(dim=1) 其实就是在“专家”这个维度（dim=1）上求和。
+            # 最终 y = [[ 1.3, 1.3, 1.3 ]] (形状回到 (1, 3))
+            # 我们要把同一个 Token 的 2 个专家结果合二为一。
+            # 如果我们对 dim=0 求和：那是把所有 Token 加在一起（错误）。
+            # 如果我们对 dim=2 求和：那是把 128 维特征加在一起（错误）。
+            # 我们要对 dim=1 求和：也就是把第 1 维里的那 2 个专家加起来。
             y = y.view(*orig_shape)
+            # 把 y 的输出还原为三维的 (Batch_Size, Seq_Len, Hidden_Size)。
         else:
+            # 如果是推理状态，会有专门的 moe 实现。
             y = self.moe_infer(x, flat_topk_idx, topk_weight.view(-1, 1)).view(*orig_shape)
         if self.config.n_shared_experts > 0:
+            # 共享专家融合，MoE 中的“路由专家”是特长生，只处理特定任务；而“共享专家”是全才，每个 Token 都要经过它们。
             for expert in self.shared_experts:
                 y = y + expert(identity)
+                # 共享专家负责捕获公共的、基础的知识，减少路由专家的负担，同时能提高模型的训练稳定性。
         self.aux_loss = aux_loss
+        # 这里的 aux_loss 由 Gate 计算。
         return y
 
     @torch.no_grad()
+    # 对整个函数开启无梯度模式，用于节省显存和加速计算，实际上这里节省的显存就是激活值。
+    # 这里这个函数是 MoE 推理阶段的优化，核心逻辑是按专家分组处理。
     def moe_infer(self, x, flat_expert_indices, flat_expert_weights):
+        # 首先需要介绍一下这里的参数：
+        # flat_expert_indices 就是一个长度为 $2 \times 3 \times 2 = 12$ 的一维长条。
+        # [专家1, 专家3, 专家2, 专家1, 专家4, 专家2, 专家3, 专家4, 专家1, 专家2, 专家3, 专家2]
+        # flat_expert_weights 就是 topk_weight，只不过做了 shape 变形，如下所示：
+        # [
+        #  [0.7], # 对应 Token 0, 专家 1
+        #  [0.3], # 对应 Token 0, 专家 2
+        #  [0.8], # 对应 Token 1, 专家 0
+        #  [0.2], # 对应 Token 1, 专家 1
+        #  [0.6], # 对应 Token 2, 专家 2
+        #  [0.4]  # 对应 Token 2, 专家 0
+        # ]
         expert_cache = torch.zeros_like(x)
+        # 创建一个和输入 x 形状一样的全零张量，用来累计所有专家的输出结果。
+        # 在 LLM 中输出 y 和输入 x 的形状是完全一样的。
         idxs = flat_expert_indices.argsort()
+        # argsort() 会把原本乱序分配给专家的任务，按照专家编号排好队。
+        # 假设 flat_expert_indices 如下：
+        # 索引位置：      0  1  2  3  4  5
+        # 选中的专家号： [1, 2, 0, 1, 2, 0]
+        # 那么重排后就为 idxs = [2, 5, 0, 3, 1, 4]。
         tokens_per_expert = flat_expert_indices.bincount().cpu().numpy().cumsum(0)
+        # bincount 用来统计每个专家出现的次数，上面的例子就是 [2,2,2]。
+        # .cpu().numpy() 把结果从 GPU 搬到 CPU 并转成 NumPy 数组，因为在 Python 的 for 循环里遍历 NumPy 数组比遍历 GPU Tensor 效率更高，也更方便。
+        # .cumsum(0) 的含义是计算前缀和，它会把前面的次数累加起来，这里就是 [2,4,6]。
+        # 所以这里的 tokens_per_expert 就是 2 4 6，这会和 idxs 联动起来，idxs: [2, 5,  0, 3,  1, 4] (前两个是专家 0 的，中间两个是专家 1 的，最后两个是专家 2 的)。
         token_idxs = idxs // self.config.num_experts_per_tok
+        # 本来 flat_expert_indices 是按照 token 顺序标注好了专家下标。
+        # idxs 则打乱了 token 顺序，直接按照专家下标分了组。
+        # 但其实我们知道原始下标和 idxs 下标的映射关系，因此可以直接做映射：
+        # idxs = [2, 5, 0, 3, 1, 4] 的意思是原来的 2 5 index token 对应的是专家 0。
+        # 这里的 token_idxs = idxs // self.config.num_experts_per_tok 本质上就是从 idxs = [2, 5, 0, 3, 1, 4] 还原出原始 token 下标。
+        # token_idxs = [2//2, 5//2, 0//2, 3//2, 1//2, 4//2]
+        # 结果如下 token_idxs = [1, 2, 0, 1, 0, 2]
+        # 这意味着，第 1 个和第 2 个 token 对应的是 0 号专家。
+
+
         # 当tokens_per_expert = [6, 15, 20, 26]，tokens_per_expert.shape[0]即为专家数量（此时为4）
         # 且token_idxs = [3, 7, 19, 21, 24, 25,  4,  5,  6, 10, 11, 12...] 时
         # 意味token_idxs[:6] -> [3, 7, 19, 21, 24, 25]这6个位置属于专家0处理的token（每个token有可能被多个专家处理，这取决于num_experts_per_tok）
         # 接下来9个位置token_idxs[6:15] -> [4,  5,  6, 10, 11, 12...]属于专家1处理的token...依此类推
         for i, end_idx in enumerate(tokens_per_expert):
+            # len(tokens_per_expert) 就是专家的个数，i 则是专家编号。
             start_idx = 0 if i == 0 else tokens_per_expert[i - 1]
+            # start_idx 就是找到专家[i]负责的 idxs 的起始。
+            # end_idx 就是找到专家[i]负责的 idxs 的终止。
             if start_idx == end_idx:
+                # 如果这个专家一个 Token 也没选它（start == end），直接跳过。
                 continue
             expert = self.experts[i]
+            # 找到专家。
             exp_token_idx = token_idxs[start_idx:end_idx]
+            # 拿到原始 Token 的索引（比如 [1, 2]）
             expert_tokens = x[exp_token_idx]
-            expert_out = expert(expert_tokens).to(expert_cache.dtype)
-            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]])
+            # 根据索引从 x 中抠出特征向量。
+            # 这里的 expert_tokens 就是要交给 expert[i] 进行推理的 tokens。
+            # 注意这里的 token 是没有经过复制的 token。
+            expert_out = expert(expert_tokens).to(expert_cache.dtype) # 把打包好的 Token 丢给专家，得到输出。
+            expert_out.mul_(flat_expert_weights[idxs[start_idx:end_idx]]) 
+            # idxs：Gate 产生的逐 token 结果，按照专家编号从小到大排列的 list，idxs[i] 就是 double token 的 index。
+            # 如果 idxs[start_idx:end_idx] 是 [2,5]，那么 flat_expert_weights[[2, 5]] 就能从 flat_expert_weights 中把属于专家 0 的那两个权重抠出来。
+            # * expert_out 形状是 (当前批次Token数, Hidden_Size)。
+            # * weights 形状是 (当前批次Token数, 1)。
+            # * mul_：这是 multiply 的原地版本（In-place）。
+            # 权重切片的第 2 维是 1，而 expert_out 的第 2 维是 Hidden_Size（比如 128）。PyTorch 会自动把这个 1 扩展成 128。
+            # 因此上述代码的本质就是将对应专家处理的输出 * Gate 输出的专家权重。
             expert_cache.scatter_add_(0, exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]), expert_out)
+            # expert_cache 就是最终存放输出的地方。
+            # target.scatter_add_(dim, index, src) 的用法如下：
+            # 1. target：最终要汇总的大表（收纳盒）。
+            # 2. dim：沿着哪个维度分发（通常 0 代表行，1 代表列）。
+            # 3. index：地址清单（标签），形状必须和 src 一致。
+            # 4. src：你要分发的数据源（零件）。
+            # 因此本质上就等效于 target[index, :] += srcp[index, :]。
+
+            # exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]) 就是 index，他的用法是：
+            # token_idxs = [1, 2, 0, 1, 0, 2]
+            # exp_token_idx = token_idxs[start_idx:end_idx]
+            # 因此 exp_token_idx 就是 [1, 2]，这里的 exp_token_idx 是原始的输入 token 的下标。
+            # exp_token_idx.view(-1, 1) 就是 [[1], [2]]
+            # 然后来一个 .repeat(1, x.shape[-1])，x.shape[-1] 就是 hidden_size。
+            # 那么 index 就是 [[1, 1, 1], [3, 3, 3]]。
+            
+            # 注意，在 scatter_add_ 中，index 和 src 的 size 必须一致。
+            # 他的索引流程如下：
+            # 对于 src 中的每一个元素 src[i][j]：
+            # - 它在 index 中对应的位置也是 [i][j]。
+            # - 它在 index[i][j] 处读到一个数值，假设这个值是 k。
+            # 那么，src[i][j] 就会被加到 target[k][j] 上。
+            # 数学表达：
+            # 如果 dim=0：target[index[i][j]][j] += src[i][j]
+            # 如果 dim=1：target[i][index[i][j]] += src[i][j]
 
         return expert_cache
+        # 在这里总结下训练时 MoE 逻辑和推理时 MoE 逻辑的区别：
+        # 1. 训练时追求吞吐。GPU 喜欢**“整块、连续、死板”**的任务。训练代码通过 repeat_interleave 把复杂的分发逻辑变成了简单的矩阵切片。虽然多花了一倍显存，但换取了极高的算力利用率（Tensor Cores 跑得满），且方便自动微分（Autograd）追踪梯度。
+        # * 稠密化（Dense）：通过 repeat_interleave 将输入强行扩充为规则的长方形矩阵。
+        # * 全量并行：不管专家被分配了多少 Token，都以统一的形状送入循环。
+        # * 空间换效率：显存占用翻倍（$Batch \times TopK$），但内存访问是连续的。
+        # 2. 推理时追求延迟和显存。推理通常是逐 Token 或小 Batch 进行的，此时显存带宽和容量是瓶颈。moe_infer 通过 scatter_add_ 实现了**“原地更新”**，避免了数据翻倍。虽然逻辑复杂（有排序、有索引），但在不计算梯度的情况下，这种灵活性能让显存占用降到最低。
+        # * 稀疏化（Sparse）：保持输入大小不变，通过索引（Index）在不同专家间“跳跃”处理。
+        # * 分组聚合：先用 argsort 给 Token 按专家编号排队，然后一拨一拨地处理。
+        # * 时间换空间：显存占用极低，但非连续的内存访问（Scatter/Gather）开销较大。
+    
 
 # 单个 Transformer Decoder Block
 class MiniMindBlock(nn.Module):
