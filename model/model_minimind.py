@@ -206,41 +206,133 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
 
 # 应用位置编码
 def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    # 这段代码实现了 RoPE (Rotary Positional Embedding) 的核心逻辑。它通过复数旋转的数学技巧，将位置信息注入到向量中。
     def rotate_half(x):
+        # 这是一个辅助函数，用于将输入向量的维度“切半”并重组。
+        # 下面是 rotate_half 的具体操作。
+        # 由于使用了 ...（Ellipsis）和 dim=-1，无论前面有多少个维度（不管是 bsz、seq_len 还是 heads），这个操作只针对每个头内部的向量进行旋转准备。
+        # x.shape[-1] 就是 head_dim，代码的执行步骤为：
+        # 1. 计算中点：x.shape[-1] // 2 结果是 4 // 2 = 2。
+        # 2. 取后半部分并取负：-x[..., 2:] 得到 [-3, -4]。
+        # 3. 取前半部分：x[..., :2] 得到 [1, 2]。
+        # 4. 拼接（Cat）：将两者按最后维度拼接。
+
+        # 如果是一个形状为 (batch, heads, seq, 64) 的张量，它会保持前三个维度不动。
+        # 只在最后一个维度（长度 64）上，把后 32 个元素取负并搬到前 32 个位置，把前 32 个元素搬到后 32 个位置。
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+        # dim 决定了“缝合”的方向，而 ... 决定了“哪些地方不动”。
+        # ... (Ellipsis)：代表“不管前面有多少层，统统原样保留”。这是一个极其强大的占位符。在 Python 和 PyTorch 中，它的意思是：自动补全中间所有的维度索引。
+        # 假设 x 的形状是 (Batch, Seq, Head, Dim)，也就是 (1, 10, 8, 128)，如果我们写 x[..., :64]，PyTorch 会自动把 ... 替换成 0:1, 0:10, 0:8。它的意思是：“前面的 Batch、Seq、Head 我都要了，我只切最后一个维度（Dim）的前 64 个”。
+        # 如果没有 ...，我们可能得写成 x[:, :, :, :64]，万一哪天我们把模型改成了 5 维张量（比如加了并行组），我们的代码就报错了。
+
+        # 我在这里详细介绍一下 torch.cat 的作用：
+        # torch.cat（concatenate 的缩写）是 PyTorch 中最常用的张量拼接函数。它的核心作用是将多个张量沿着指定的维度“首尾相接”地拼成一个更大的张量。
+        # torch.cat(tensors, dim=0, out=None)，tensors: 一个张量序列（如 [a, b, c]）。注意： 除了拼接的那个维度，其他所有维度的形状必须完全一致。dim: 沿着哪个维度拼接。默认为 0。
+        # A = torch.tensor([[1, 2, 3],
+        #                 [4, 5, 6]])
+        # B = torch.tensor([[7, 8, 9],
+        #                 [10, 11, 12]])
+        # res0 = torch.cat([A, B], dim=0)
+        # 结果形状: (4, 3) -> 行数变多了
+        # tensor([[ 1,  2,  3],
+        #         [ 4,  5,  6],
+        #         [ 7,  8,  9],
+        #         [10, 11, 12]])
+        # res1 = torch.cat([A, B], dim=1)
+        # 结果形状: (2, 6) -> 列数变多了
+        # tensor([[ 1,  2,  3,  7,  8,  9],
+        #         [ 4,  5,  6, 10, 11, 12]])
+
+        # 这里简单介绍一下 torch.stack()，它不是在现有维度上拼接，而是“凭空”创造一个新维度，把张量叠放进去。 
 
     q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))
     k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))
+    # 它利用三角函数的特性，将 $q$ 和 $k$ 向量在空间中旋转一个角度，从而注入位置信息。
+    # q_embed 和 k_embed 就不再是普通的特征向量了，而是“带了指南针”的向量。它们知道自己在句子里的哪个位置，也知道别的词离自己有多远。
+
+    # 为什么只有 QKV 需要旋转？
+    # 位置编码是为了计算“关系”，而 V 代表的是“内容”。
+    # Q 和 K 旋转是为了在匹配过程中引入“距离感”（比如让模型知道这个词就在我旁边）。
+    # V 不旋转是为了保证提取到的“信息内容”是纯净且稳定的。
     return q_embed, k_embed
 
 # GQA 的键值复制
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
     bs, slen, num_key_value_heads, head_dim = x.shape
+    # 获取当前的批大小、序列长度、KV 头数以及每个头的维度。
+    # 此时 x 的形状是 (Batch, Seq, KV_Heads, Dim)。
     if n_rep == 1:
+        # 如果 n_rep 是 1，说明 Q 头和 KV 头的数量已经相等（即标准的 Multi-Head Attention），直接返回原张量，不做任何多余操作。
         return x
     return (
+        # x[:, :, :, None, :] 等用于 x.unsqueeze(3)。
+        # 假设输入 x 是 KV 张量，形状为 (bsz, seq_len, num_kv_heads, head_dim)，
+        # 执行 x[:, :, :, None, :] 后，形状变为 (bsz, seq_len, num_kv_heads, 1, head_dim)。
+
+        # 在上一行代码 x[:, :, :, None, :] 之后，张量的形状是：
+        # (bs, slen, num_kv_heads, 1, head_dim)
+        # 当我们执行 .expand(bs, slen, num_kv_heads, n_rep, head_dim) 时：
+        # PyTorch 发现第 4 维（索引为 3）原来是 1，而我们要求变成 n_rep（比如 4）。
+        # 于是，它在逻辑上把这一个维度扩充了 4 倍。
+
+        # torch.repeat：会实打实地申请新的内存空间，把数据拷贝 4 份。torch.expand：完全不复制数据。它只是修改了张量的“步长”（Stride）。它极其节省内存，操作几乎是瞬间完成的。
+        # 从换元法的角度考虑，他是从 1 * head_dim 变成了 n_rep * head_dim。
         x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+        # 现在 x 的 size 变成了 (bs, slen, num_key_value_heads, n_rep, head_dim)，做了 reshape 之后变为：
+        # (bs, slen, num_key_value_heads * n_rep, head_dim)。
+
+        # 这里有点类似于 view，下面讲一下 view 和 reshape 的区别：
+        # view 的核心是，不移动任何数据，只改变对内存的“解释方式”。
+        # 它要求张量在内存中必须是连续的（Contiguous）。
+        # 它直接修改张量的 Shape 和 Stride（步长）元数据。
+        # 如果我们对张量做过 transpose(1, 2) 或 permute，内存里的数据顺序已经和逻辑顺序不一致了。此时调用 view 会报错。
+
+        # reshape 的核心是：只要能变，怎么都行。
+        # 其逻辑是先尝试调用 view（如果内存连续，速度极快）。
+        # 如果内存不连续（比如转置过），它不会报错，而是默默地在后台执行 .contiguous().view(...)。
+        # 那么，如果内存不连续，reshape 会**克隆（Clone）**一份数据到新的内存地址。这意味着它可能会产生额外的显存开销。
     )
 
 # 多头注意力（支持 FlashAttention）
 class Attention(nn.Module):
+    # 这段代码是一个基于 PyTorch 实现的 多头自注意力机制（Multi-Head Attention），它特别支持了 GQA（Grouped-Query Attention） 分组查询注意力以及 Flash Attention 加速。
     def __init__(self, args: MiniMindConfig):
         super().__init__()
         self.num_key_value_heads = args.num_attention_heads if args.num_key_value_heads is None else args.num_key_value_heads
+        # self.num_key_value_heads = ...: 确定 KV 头的数量。如果配置文件没指定，就和 Query 头的数量一致（即标准多头注意力 MHA）。
+        # args.num_key_value_heads 就是 KV 的头数。
+        # args.num_attention_heads 就是 Q 的头数。
+
+        # 在传统的 MHA (Multi-Head Attention) 中，Q、K、V 的头数是 1:1:1。而在 GQA (Grouped-Query Attention) 中每一个 Token 依然拥有完整的、与其 num_heads 对应的 Q。但是，多个 Q 头会共用同一个 KV 头。
         assert args.num_attention_heads % self.num_key_value_heads == 0
+        # 确保 Query 头的数量能被 KV 头的数量整除，这是实现 GQA 的前提。
+        # 同时，这里还需要保证 hidden size 能够被 num_attention_heads 整除。
         self.n_local_heads = args.num_attention_heads
+        # 记录 Query (Q) 的总头数。
         self.n_local_kv_heads = self.num_key_value_heads
+        # 记录 Key 和 Value (KV) 的总头数。在 GQA 架构中，这个值通常小于 Q 的头数。
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
+        # 计算 分组倍数。比如有 8 个 Q 头，2 个 KV 头，那么 n_rep = 4，意味着每 4 个 Q 头共用 1 个 KV 头。
         self.head_dim = args.hidden_size // args.num_attention_heads
+        # 计算 每个头的维度。例如 hidden_size=512，有 8 个头，那么每个头维度就是 64。
         self.q_proj = nn.Linear(args.hidden_size, args.num_attention_heads * self.head_dim, bias=False)
+        # Wq：定义 Q 的投影矩阵。输出的总维度是 $num\_heads \times head\_dim$（通常等于 hidden_size）。
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # Wk：定义 K 的投影矩阵。注意：它的输出维度由 num_key_value_heads 决定，比 Q 短。
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
+        # Wv：定义 V 的投影矩阵。同样，为了实现 GQA，其维度与 K 保持一致。
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        # Wo：定义输出投影层。它将所有头拼接后的结果映射回 hidden_size 维度，用于残差连接。
         self.attn_dropout = nn.Dropout(args.dropout)
+        # 用于注意力权重矩阵（Softmax 之后）的 Dropout。
         self.resid_dropout = nn.Dropout(args.dropout)
+        # 用于最终输出投影（o_proj 之后）的 Dropout，增强模型泛化能力。
         self.dropout = args.dropout
+        # 将 dropout 概率存为变量，方便后续在调用 Flash Attention 函数时直接传参。
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        # 1. 检查 PyTorch 是否自带高效的 scaled_dot_product_attention 函数。
+        # 2. 检查配置 args.flash_attn 是否开启。
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
@@ -249,44 +341,190 @@ class Attention(nn.Module):
                 past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                 use_cache=False,
                 attention_mask: Optional[torch.Tensor] = None):
+        #  x: 输入张量，形状通常为 (Batch, Seq_Len, Hidden_Size)。
+        # position_embeddings: 预计算好的旋转位置编码（RoPE）所需的 cos 和 sin 值。
+        # past_key_value: 推理加速用的 KV 缓存。如果是训练阶段，通常为 None。
+        # use_cache: 布尔值，决定是否返回更新后的 KV 缓存。
+        # attention_mask: 掩码，用于遮盖 Padding 部分或防止模型看到未来信息。
+
         bsz, seq_len, _ = x.shape
+        # 获取当前的 Batch Size (bsz) 和 序列长度 (seq_len)。第三个维度是 hidden_size，这里用 _ 忽略，因为投影层已经定义好了。
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # 将输入 x 分别通过三个线性层，映射到 Q、K、V 空间。
+        # 注意由于采用了 GQA，xq 的维度通常比 xk 和 xv 大（因为 Q 的头数更多）。
+
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        # 维度重塑，这一步是将扁平的输出向量**“切分”成多个头**。
+        # 转换后的维度为：(Batch, Seq_Len, Num_Heads, Head_Dim)。
+        # 这里的 n_local_heads (Q) 和 n_local_kv_heads (K/V) 体现了 GQA 的非对称性。
 
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        # 调用外部函数 apply_rotary_pos_emb。
+        # 它利用复数旋转的思想，将 cos 和 sin 注入到 xq 和 xk 中。
+        # RoPE 让模型能够通过 Q 和 K 向量之间的相对夹角来感知 Token 之间的相对距离，而不是依赖绝对位置。
+        # 只有 Q 和 K 需要位置编码来计算注意力得分，V 存储的是内容信息，不需要旋转。
 
         # kv_cache实现
         if past_key_value is not None:
+            # 检查是否传入了之前步骤缓存的 K 和 V。
+            # 在生成式对话中，模型每产生一个新 Token，不需要重新计算前面所有 Token 的 K 和 V，直接从缓存里拿即可。
+            # past_key_values = [
+            # --- 第一层 (Layer 0) ---
+            #     (
+            #         torch.randn(1, 4, 3, 8), # Key 张量: [Batch, Seq, Heads, Dim]
+            #         torch.randn(1, 4, 3, 8)  # Value 张量: [Batch, Seq, Heads, Dim]
+            #     ),
+            #     # --- 第二层 (Layer 1) ---
+            #     (
+            #         torch.randn(1, 4, 3, 8), # Key 张量
+            #         torch.randn(1, 4, 3, 8)  # Value 张量
+            #     )
+            # ]
+            # 这里的 past_key_value 就是 (
+            #     torch.randn(1, 4, 3, 8), # Key 张量: [Batch, Seq, Heads, Dim]
+            #     torch.randn(1, 4, 3, 8)  # Value 张量: [Batch, Seq, Heads, Dim]
+            # ),
+            # ⭐️⭐️⭐️ 理解高维张量时可以采用换元法。
             xk = torch.cat([past_key_value[0], xk], dim=1)
+            # 把新的 Key 接在旧的 Key 后面，形成一个包含“过去+现在”完整上下文的 Key 矩阵。
             xv = torch.cat([past_key_value[1], xv], dim=1)
+            # 把当前新 Token 的 Value 拼接到旧的 Value 缓存后面。
         past_kv = (xk, xv) if use_cache else None
+        # 如果 use_cache 为真，则将更新后的（包含了当前 Token 的）完整 K 和 V 返回，供下一个时间步使用。
+        # 这里的 past_kv 只在推理时生效。
 
+        # 这里通过维度交换和数据复制，把张量调整成符合矩阵乘法要求的格式。
         xq, xk, xv = (
             xq.transpose(1, 2),
+            # xq 的形状是 (bsz, seq_len, n_heads, head_dim)。
+            # 第 1 维是序列长度，第 2 维是头数。
+            # transpose(1, 2) 交换了这两维。
+            # 结果形状 (bsz, n_heads, seq_len, head_dim)。
+            # PyTorch 的批量矩阵乘法（@）操作的是张量的最后两维，因此我们需要交换。
             repeat_kv(xk, self.n_rep).transpose(1, 2),
+            # 完成这里的 repeat_kv 之后，输出向量就变成了 (bsz, seq_len, n_heads, head_dim)，
+            # 然后进行 transpose(1,2) 就变成了 (bsz, n_heads, seq_len, head_dim)。
             repeat_kv(xv, self.n_rep).transpose(1, 2)
         )
 
         if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            # Flash Attention 虽快，但它对输入非常“挑剔”。这一长串判断是在确认：当前场景是否满足开启高速通道的条件？
+            # 1. self.flash 代表 PyTorch 自带高效的 scaled_dot_product_attention 函数且用户开启了 flash_attn。
+            # 2. 如果序列长度只有 1（比如推理时逐字生成），Flash Attention 的并行优势发挥不出来，普通的矩阵乘法反而可能更快。
+            # 3. past_key_value is None 意味着这是全量并行计算（训练或 Prefill 阶段），而不是增量生成阶段。目前的 Flash Attention 主要是为大规模并行计算设计的。
+            # 4. attention_mask is None or torch.all(attention_mask == 1)。检查是否没有自定义的复杂掩码。如果所有的 mask 都是 1（即全部可见），或者干脆没有 mask，那么就可以使用预设的模式。
+
+            # 这里的 Attention mask 其实就是 Padding Mask。这里的限制条件是说，当这行代码执行时，逻辑上已经确认了除了因果掩码外，没有其他需要屏蔽的位置。既然没有 Padding，那就不需要把额外的 Mask 传给算子。
+            # 为什么这里要限制 Attention Mask 为 None 或者无 Padding 呢？
+            # 这是因为 FlashAttention 这种极速计算最讨厌“不规则”的东西。
+            # 如果每个 Batch 的 Padding 长度都不一样，算子处理起来会变复杂。
+            # 所以很多实现（包括 Llama 原生代码）会倾向于如果有复杂的 Padding Mask，就走普通的手动路径；如果场景简单（全是有效词 + 只有因果掩码），就走 Flash 路径。
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+            # 这是 PyTorch 2.0+ 引入的神级函数。它把原本需要好几行代码完成的动作，全部打包进了一个底层的 C++/CUDA 算子中。
+            # 它为什么快？普通的注意力计算（手动写的那种）会产生巨大的中间变量注意力分数 Score。
+            # Flash Attention 利用 Tiling（分块） 技术，在 SRAM（GPU 内部的高速缓存）里就把计算做完了，根本不往显存里存那张大表。
+            # 当我们设置 is_causal=True 时，我们告诉算子：请帮我自动做一个下三角掩码（Casual Mask），让每个词只能看到它之前的词。
+            # 这省去了我们手动创建一个 (seq, seq) 矩阵并填入 -inf 的麻烦。
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            # 此时 Q 和 K 的形状都是 (bs, n_heads, seq_len, head_dim)
+            # 将 K 的最后两维转置，变成 (head_dim, seq_len)，然后进行矩阵乘法。
+            # 得到 scores，形状为 (bs, n_heads, seq_len, seq_len)。这张图里的每一个点 (i, j) 代表了第 i 个词对第 j 个词的“关注度”。
+            # / math.sqrt(self.head_dim) 是缩放，防止点积数值过大导致 Softmax 后的梯度消失（变得太尖锐）。
+
             scores[:, :, :, -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device=scores.device), diagonal=1)
+            # torch.full((seq_len, seq_len), float("-inf"), device=scores.device) 会生成一个全是 -inf 的方阵，如下所示：
+            # [[-inf, -inf],
+            # [-inf, -inf]]
+            # torch.triu(..., diagonal=1) 之后，只保留主对角线以上的部分，其余变 0。
+            # [[0, -inf],
+            #  [0,   0]]
+            # 加上 scores 之后，左下角（含对角线）加上了 0：原得分保持不变。右上角加上了 -inf：原得分变成负无穷。
 
+            # 可以说，torch.triu 这个函数的本质就是保留“上三角”，把“剩下”的部分变成 0。
+            # 这里之所以设计为 diagonal=1，就是为了看到自己，如下所示：
+            # [[   0, -inf, -inf],
+            #  [   0,    0, -inf],
+            #  [   0,    0,    0]]
+
+            # 关于这里为什么是 scores[:, :, :, -seq_len:]，而不是 scores[:, :, :, :]？
+            # ⭐️⭐️⭐️ 这其实需要解释一下 x.shape 在不同阶段下的变换。
+            # 1. 在训练阶段，我们是并行处理一整串 Token 的。x 的形状变化非常死板且固定，就是 (B, L, D)。
+            # 2. 在推理的 Prefilling，这时的形状和训练阶段几乎一模一样，因为它也是一次性处理 L 个词，因此也是 (B, L, D)。
+            # 3. 在推理的 Decoding，这是我们最需要关注的，此时 x 变得不一样，他变成了 [B, 1, D]，注意：中间永远是 1，因为一次只投喂一个新词。
+
+            # 此外，在推理的 Decoding 阶段，由于 KV Cache 的存在，虽然 Q 的 seq_len 是 1，但是 KV 的 seq_len 是 L。
+            # 注意，这里的 Q 是当前 token 的 Q，预测的是下一个 token。
+
+            # 所以，所以在推理的 decoding 阶段，这里的 scores 的 size 是什么？
+            # 是 (bs, n_heads, 1, L)。
+            # 这里的 seq_len == 1，这在推理阶段的 Decoding 时，几乎是没有意义的，因为这等效于 scores[:, :, :, -1:] += 0。
+            # 从物理意义上讲，这完全行得通 =>
+            # 1. Query 只有 1 个：就是当前词。
+            # 2. Keys 有 T 个：全都是过去发生的（或者是当前词自己）。
+            # 3. 因果律：当前词看过去，没有任何问题。它根本不需要“遮盖”任何东西，因为它后面还没有词呢！
+            # 所以，Mask 变成全 0（即不遮挡任何东西），逻辑是自洽的。
+
+            # 但这段代码可以同时兼容 Prefilling（预填充） 和 Decoding（解码）。在 Prefilling 时，seq_len 是 N（比如 512）。此时 mask 是一个 512 \times 512 的矩阵，triu 会切掉右上角，非常关键。通过写成一行通用的代码，作者不需要写繁琐的 if-else。
+            # 在一些高级推理技术中（如投机采样），模型可能会一次性尝试预测并验证 5 个词。此时 seq_len = 5。这时，这 5 个新词之间就产生了“因果关系”（第 1 个不能看第 5 个）。此时 -seq_len: 配合 triu 就能立刻发挥作用，确保这小块 5 \times 5 的区域符合因果律。
+
+            # 综上就解释了为什么是 scores[:, :, :, -seq_len:]，而不是 scores[:, :, :, :]，这里的 seq_len 就是 x 的 seq_len，也可以是做要并行预测的 token 数。
             if attention_mask is not None:
+                # Attention mask 不为 None，这代表着存在 Padding Mask。
+                # attention_mask 形状通常是 (bs, total_len)。里面只有 1（有效词）和 0（Padding 占位符）。
                 extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                # 进行 .unsqueeze(1).unsqueeze(2) 之后，mask 形状变成了 (bs, 1, 1, total_len)。
+                # 这是为了利用 广播机制 (Broadcasting)。scores 的形状是 (bs, n_heads, seq_len, total_len)。通过增加这两个维度，这个 Mask 就能像一张“滤网”一样，自动复制并覆盖到每一个 head 和每一个 query 上。
                 extended_attention_mask = (1.0 - extended_attention_mask) * -1e9
+                # 经过这一步变换，有效词部分：0 * -1e9 = 0；Padding 部分：1 * -1e9 = -1,000,000,000（一个极大的负数）。
                 scores = scores + extended_attention_mask
+                # scores 是 (bs, n_heads, seq_len, seq_len)，第二个 seq_len 其实就是带了 kvcache 的 total_len。
+                # extended_attention_mask 是 (bs, 1, 1, total_len)。
+                # 将处理好的掩码直接加到原始得分 scores 上。
+                # 结果就是有效词的位置：scores + 0 = scores（得分保持不变）。Padding 的位置：scores + (-1e9) \approx - \infty（得分变得极小）。
 
+            # 现在的 scores 就是做了因果掩码和 Padding 掩码的 score 了。
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            # .float(): 这是一个非常关键的细节。在深度学习中，Softmax 涉及指数运算（$e^x$），如果使用半精度（FP16/BF16），很容易出现数值溢出或不精准。所以先转成 FP32 计算，保证稳定。
+            # dim=-1: 在最后一维（即 total_len 维度）做归一化，表明了对于某个 Q 来说，所有的 K 对于他的重要性。
+            # .type_as(xq) 算完后再转回原先的低精度（如 BF16），为了和后面的张量对齐并节省显存。
+            
+            # 这里为什么需要转 FP32？
+            # 这是一个非常经典且关键的数值稳定性（Numerical Stability）问题。简单来说，Softmax 对精度极其敏感，而低精度（FP16）容易让模型“变瞎”或“崩溃”。
+            # 对于 Softmax 操作转回 FP32 的操作，这是非常常见的，我们一般称之为混合精度训练。
+            # 一般来说，大部分的运算走 bf16 精度就够用了，但是对于像 Softmax、LayerNorm 和位置编码等操作，我们都需要 .float() 将其由 BF16 转 FP32。
+            # 但是我们之前是使用 AMP 进行混合精度管理的，只需要使用 with torch.cuda.amp.autocast()，大部分混合精度训练都不需要手动。
+            # 一般来讲，写业务代码/微调模型时，我们不需要管混合精度训练，autocast 一开万事大吉。
+            # 写模型底层架构（如 Attention）时，我们必须像个老司机一样，在 Softmax、Norm 等关键弯道，手动踩下 FP32 的刹车。
+            
+            # with torch.cuda.amp.autocast() 底层的实现原理是什么呢？
+            # 当我们调用一个函数（比如 F.softmax）时，PyTorch 的 Dispatcher（调度器） 会先检查当前是否在 autocast 环境下。如果是，它会查找这个函数在不在黑名单里。如果在，它会偷偷帮我们做一个 .float() 转换。
+            
+            # Pytorch 原生算子。通常只要你调用的是 torch.xxx、torch.nn.functional.xxx 或张量自带的方法，它们绝大多数都是原生算子。
             scores = self.attn_dropout(scores)
+            # Dropout。
+            # 在训练阶段，这是为了防止模型只盯着某一个词看，强迫它去挖掘其他词的潜在联系。
+            # dropout 在推理时是自动关闭的（通常由 model.eval() 触发）。此时这行代码相当于 scores = scores，啥也不干。
             output = scores @ xv
+            # 这是整个 Attention 模块最核心的加权求和操作。
+            # scores：形状是 (bs, n_heads, seq_len, total_len)。
+            # 它的物理含义是：“权重”。每一行都代表当前 Query 对所有历史位置的关注程度。
+            # xv：形状是 (bs, n_heads, total_len, head_dim)。
+            # 它的物理含义是：“内容”。每一行都是历史 Token 真正携带的信息特征。
+            # @ 计算过程：(seq_len × total_len) @ (total_len × head_dim)。
+            # 结果：(bs, n_heads, seq_len, head_dim)。
 
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
+        # 第一步的 .transpose(1,2) 是在进行维度变换，变成 (bs, seq_len, n_heads, head_dim)。
+        # 然后进行 reshape，将维度压缩为 (bs, seq_len, embedding_dim)。
         output = self.resid_dropout(self.o_proj(output))
+        # o_proj 是用来进行信息糅合的。
+        # 这是一个线性层（Linear Layer），也叫 Output Projection。
+        # 刚才的 reshape 只是简单的“物理拼接”，32 个头之间的信息依然是各说各的。o_proj 的矩阵乘法让这 D 个维度之间进行全连接计算。它相当于一个总编，把 32 个专家的意见进行加权整合，提取出最终的语义表示。
+        # resid_dropout 也是 Dropout。
         return output, past_kv
 
 # 简单前馈网络
@@ -389,8 +627,8 @@ class MoEGate(nn.Module):
         logits = F.linear(hidden_states, self.weight, None)
         # 用输入的 Token 特征与专家权重矩阵 self.weight 做矩阵乘法。计算结果 logits 的形状是 (总Token数, 专家总数)。
         # 那么，为什么这里不能用 logits = self.weight(hidden_states) 呢？
-        # 核心原因是 self.weight 是一个张量（Tensor）。它只是一个存储数字的矩阵，它没有实现 __call__ 方法。如果你写 self.weight(hidden_states)，Python 会报错：TypeError: 'Parameter' object is not callable。
-        # 如果你定义的是 self.gate = nn.Linear(...)，那么 self.gate 是一个包含权重、偏置和 forward 逻辑的对象。这种情况下你才能像函数一样调用它：logits = self.gate(hidden_states)。
+        # 核心原因是 self.weight 是一个张量（Tensor）。它只是一个存储数字的矩阵，它没有实现 __call__ 方法。如果我们写 self.weight(hidden_states)，Python 会报错：TypeError: 'Parameter' object is not callable。
+        # 如果我们定义的是 self.gate = nn.Linear(...)，那么 self.gate 是一个包含权重、偏置和 forward 逻辑的对象。这种情况下我们才能像函数一样调用它：logits = self.gate(hidden_states)。
 
         # F.linear 的参数是 input, weight, bias，正好对应 y = input * weight + bias。
         # 这里的 weight 其实在计算时会被转置，因此 hidden_states 是 (T, D)，而 weight.T 则是（D，E），所以最终的 logtis 是 (总Token数, 专家总数)。
@@ -414,7 +652,7 @@ class MoEGate(nn.Module):
         # topk_weight 和 topk_idx 的 size 都是（总Token数， topK 专家数）。
 
         if self.top_k > 1 and self.norm_topk_prob:
-            # 当你从所有专家中选出前 $k$ 个后，这几个人的分数加起来往往不等于 1。这段代码通过除以它们的总和，强行让这 $k$ 个人的权重加起来重新等于 100%。
+            # 当我们从所有专家中选出前 $k$ 个后，这几个人的分数加起来往往不等于 1。这段代码通过除以它们的总和，强行让这 $k$ 个人的权重加起来重新等于 100%。
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
             # topk_weight.sum(dim=-1, keepdim=True) 表示对选出来的 （总Token数， topK 专家数）按照最后一个维度进行求和。
             # 由于 tensor.sum() 一般会减少一个维度，因此 keepdim=True 保持维度，方便后面做除法（形状保持为 (Total_Tokens, 1)。
@@ -425,8 +663,8 @@ class MoEGate(nn.Module):
 
             # 广播机制会比 for 循环快出了几个数量级。
             # 在深度学习中，我们有一个原则：能用矩阵运算（向量化）就绝对不用 for 循环。
-            # 广播机制是在底层（C++ 或 CUDA 驱动级）实现的。当你执行 topk_weight / denominator 时，PyTorch 并不会真的在内存里把 denominator 复制一份，它只是在计算时逻辑上把维度对齐，然后直接调用高度优化的 CPU (AVX/SIMD) 或 GPU (Parallel Threads) 指令集。
-            # 而 for 循环是串行的。必须算完第 1 个 Token，才能算第 2 个。如果你有 8192 个 Token，就要排队 8192 次。
+            # 广播机制是在底层（C++ 或 CUDA 驱动级）实现的。当我们执行 topk_weight / denominator 时，PyTorch 并不会真的在内存里把 denominator 复制一份，它只是在计算时逻辑上把维度对齐，然后直接调用高度优化的 CPU (AVX/SIMD) 或 GPU (Parallel Threads) 指令集。
+            # 而 for 循环是串行的。必须算完第 1 个 Token，才能算第 2 个。如果我们有 8192 个 Token，就要排队 8192 次。
             # 广播 + 矩阵运算是高度并行的。在 GPU 上，成千上万个核心会同时处理这 8192 个 Token 的除法。
 
         if self.training and self.alpha > 0.0:
@@ -511,10 +749,10 @@ class MoEGate(nn.Module):
                 
                 # 引入的新问题是，为什么不只考虑 ce 或者只考虑 scores？
 
-                # 你可能会问：“直接惩罚那些干活多的专家不就行了？干嘛还要乘以概率？”，这是因为scores（概率）是可导的，而 ce（计数）是通过索引拿到的，通常不可导。通过乘以 scores，Loss 就可以通过反向传播（Backpropagation）来修改门控器的权重，从而改变未来的分配倾向。如果没有这个乘法，梯度就断了，模型就不知道该怎么调整自己。
+                # 我们可能会问：“直接惩罚那些干活多的专家不就行了？干嘛还要乘以概率？”，这是因为scores（概率）是可导的，而 ce（计数）是通过索引拿到的，通常不可导。通过乘以 scores，Loss 就可以通过反向传播（Backpropagation）来修改门控器的权重，从而改变未来的分配倾向。如果没有这个乘法，梯度就断了，模型就不知道该怎么调整自己。
 
                 # 那为什么不只考虑 scores 呢？反正只有 scores 也足够反向传播了。在这里就要说明一种情况，也就是思想上公平，但是行动不公平，即 scores 比较均衡，但是 ce 不均衡。出现这种情况的本质原因是 topk << 专家个数。
-                # 首先，scores (思想) 是连续的。在 $0.0$ 到 $1.0$ 之间有无限的可能。topk (行动) 是离散的。它是一个 0/1 决策：要么你被选中（1），要么你被抛弃（0）。当你把一个连续的分布强行塞进一个“只选前 k 个”的黑盒里时，你实际上是把 N-k 个专家的生存权利直接抹杀了。即使某个专家在思想上拿到了 12% 的好感度（仅次于前两名的 13%），在行动上它拿到的也是 0。
+                # 首先，scores (思想) 是连续的。在 $0.0$ 到 $1.0$ 之间有无限的可能。topk (行动) 是离散的。它是一个 0/1 决策：要么我们被选中（1），要么我们被抛弃（0）。当我们把一个连续的分布强行塞进一个“只选前 k 个”的黑盒里时，我们实际上是把 N-k 个专家的生存权利直接抹杀了。即使某个专家在思想上拿到了 12% 的好感度（仅次于前两名的 13%），在行动上它拿到的也是 0。
                 # 这就是 k << N 带来的必然结果，大量“还不错”的专家因为微弱的排名劣势，在宏观统计上被彻底边缘化了。
 
                 # 思想公平只是模型的一种“态度”，行动不公平则是由于 k << N 这种稀疏筛选机制造成的“残酷现实”。如果不引入 ce 这种外部约束，模型就会像一个只看名次不看分数的面试官，永远只录用那两名“面霸”，而让其他同样优秀的专家（MLP 层）在冷宫里因得不到训练而逐渐“废掉”。
@@ -546,7 +784,7 @@ class MoEGate(nn.Module):
                 # 序列级 Loss (Sequence-level)核心逻辑是强制**每一个句子（样本）**内部都要公平地分配专家。适用情况为：
                 # - 处理长文本（Long Context）。在长文本中，一个序列（Sequence）可能包含数千个 Token。如果这一个序列就塞满了某一个专家的缓冲区（Capacity），会导致该序列的处理速度极慢。序列级 Loss 强制长文本在内部就把流量摊开。
                 # - 训练初期（Warm-up 阶段）。在模型刚开始学习时，专家非常容易“塌陷”（所有 Token 都涌向同一个随机初始化较好的专家）。序列级 Loss 约束更严，能强迫模型在每一个样本处理时都去尝试不同的专家，加速专家多样性的开发。
-                # - 推理延迟敏感场景。如果你的线上服务 Batch Size 很小（甚至为 1），你必须保证单个请求（Sequence）能够均匀触发多个专家并行工作，而不是串行等待一个专家。
+                # - 推理延迟敏感场景。如果我们的线上服务 Batch Size 很小（甚至为 1），我们必须保证单个请求（Sequence）能够均匀触发多个专家并行工作，而不是串行等待一个专家。
                 # 缺点是违背自然语义，有些短句子可能真的只涉及单一主题（比如全是金融词汇），强制它分给 8 个专家（包括文学专家、代码专家）会降低精度，属于“强行摊派”。
 
                 # 全局级 Loss (Global-level)的核心逻辑是不限制单个句子，只要整个 Batch（成百上千个 Token）看过去是平的就行。适用情况为：
