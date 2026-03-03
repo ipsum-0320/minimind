@@ -6,7 +6,7 @@ from transformers import PretrainedConfig
 # 它的核心作用：
 # - 定义结构： 它规定了模型的超参数（比如 hidden_size 隐藏层维度、num_attention_heads 注意力头数等）。
 # - 加载与保存： 它可以从本地文件夹或 Hugging Face Hub 上读取 config.json 文件，也可以把当前的配置保存成 JSON。
-# - 模型初始化的桥梁： 当你创建一个模型时，系统会先看这个“说明书”，知道该盖多少层楼、挖多深的基座，然后再把“权重”填进去。
+# - 模型初始化的桥梁： 当我们创建一个模型时，系统会先看这个“说明书”，知道该盖多少层楼、挖多深的基座，然后再把“权重”填进去。
 
 # PretrainedConfig 是所有模型配置类的“祖宗”，它不负责计算，只负责告诉程序这个模型长什么样。使用 PretrainedConfig 是为了更好的兼容性和标准化。
 
@@ -38,7 +38,7 @@ class MiniMindConfig(PretrainedConfig):
             # 中间层的维度，即前馈网络的隐藏层维度。
             # 在 Transformer 的每个 Block 中，数据经过 Self-Attention 后，
             # 会进入一个 FFN（前馈神经网络） 层。这个过程通常是“先扩容，再压缩”。
-            # 输入维度是 $d_{model}$（你的 512）。
+            # 输入维度是 $d_{model}$（我们的 512）。
             # 升维（中间层）维度扩充到 intermediate_size。
             # 降维重新压回到 $d_{model}$（512）。
             max_position_embeddings: int = 32768,
@@ -59,7 +59,7 @@ class MiniMindConfig(PretrainedConfig):
             # 外推缩放参数，用于控制外推长度。
             inference_rope_scaling: bool = False,
             # 是否使用外推缩放。
-            # 假设你的模型是在 2048 长度下训练的，现在你硬要它处理 32768 长度，直接跑肯定会“变傻”，因为它没见过那么大的位置编号。
+            # 假设我们的模型是在 2048 长度下训练的，现在我们硬要它处理 32768 长度，直接跑肯定会“变傻”，因为它没见过那么大的位置编号。
             # False： 按照常规逻辑推理。
             # True： 启动 YaRN (Yet another RoPE extensioN) 等缩放算法。
             # 它通过数学手段，把 32k 的位置信息“挤”到模型原本熟悉的 2k 范围内。
@@ -311,55 +311,232 @@ class MoEGate(nn.Module):
         super().__init__()
         self.config = config
         self.top_k = config.num_experts_per_tok
+        # 每个 Token 会被路由到前 k 个专家。
         self.n_routed_experts = config.n_routed_experts
-
+        # 总共有多少个可选的专家。
         self.scoring_func = config.scoring_func
+        # 多个专家的评分设计。
+        # 通常是 softmax，决定如何将门控的原始输出转化为概率分布。
         self.alpha = config.aux_loss_alpha
+        # 辅助损失系数。用于控制负载均衡损失（Aux Loss）在总损失中的权重，防止某些专家被“累死”，某些被“闲死”。
+        # 在配置项中这个值被设置为 0.01
+
         self.seq_aux = config.seq_aux
+        # 一个布尔开关，决定是否启用 序列级辅助损失（Sequence-level auxiliary loss），这是一种更细粒度的负载均衡策略。
+        # 在配置项中这个值被设置为 True。
 
         self.norm_topk_prob = config.norm_topk_prob
+        # 一个布尔开关，决定选出 Top-K 个专家分数后，是否要对这 $k$ 个分数进行 重新归一化（使它们相加等于 1）。
+        # 在配置项中这个值被设置为 True。
+
         self.gating_dim = config.hidden_size
+        # 门控输入维度。即模型隐藏层的维度（例如 512 或 1024），门控器需要在这个维度上进行线性投影。
+
         self.weight = nn.Parameter(torch.empty((self.n_routed_experts, self.gating_dim)))
+        # 核心可学习参数。创建门控权重矩阵。
+        # 它的形状是 (专家数, 隐藏层维度)。
+        # 他的原理相当于为每个专家学习一个“原型向量”。
+        # 输入向量与这个权重矩阵相乘，本质上是在计算输入与各个专家的相似度。
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        # 这里的 init.kaiming_uniform_ 只对门控权重网络 self.weight 使用 Kaiming Uniform (He初始化) 方案。
+        # MoE 的门控层本质上是一个线性层。这种初始化方法能保证在深度网络中，信号在每一层传递时方差保持稳定，避免训练初期的梯度消失或爆炸。参数 a=math.sqrt(5) 是 PyTorch 默认线性层（nn.Linear）的标准初始化配置。
+
+        # PyTorch 内置的“层”（Modules）绝大多数都自带了相对科学的默认初始化，只有 nn.Parameter 除外。
+        # 当我们使用 PyTorch 提供的标准层时，它们在构造函数 __init__ 里都会自动调用一个类似 reset_parameters() 的方法。
 
     def forward(self, hidden_states):
+        # 这段 forward 函数是 MoE 门控机制的核心逻辑。它负责两件事：
+        # 第一，决定每个 Token 去哪（路由）；
+        # 第二，计算负载均衡损失（防止专家闲置）。
         bsz, seq_len, h = hidden_states.shape
+        # 维度获取——获取批次大小 (bsz)、序列长度 (seq_len) 和隐藏层维度 (h)。
         hidden_states = hidden_states.view(-1, h)
+        # 打平 (Flatten)，将三维张量压扁成二维 (bsz * seq_len, h)，因为门控打分是针对每个 Token 独立进行的，不需要考虑序列结构。
         logits = F.linear(hidden_states, self.weight, None)
+        # 用输入的 Token 特征与专家权重矩阵 self.weight 做矩阵乘法。计算结果 logits 的形状是 (总Token数, 专家总数)。
+        # 那么，为什么这里不能用 logits = self.weight(hidden_states) 呢？
+        # 核心原因是 self.weight 是一个张量（Tensor）。它只是一个存储数字的矩阵，它没有实现 __call__ 方法。如果你写 self.weight(hidden_states)，Python 会报错：TypeError: 'Parameter' object is not callable。
+        # 如果你定义的是 self.gate = nn.Linear(...)，那么 self.gate 是一个包含权重、偏置和 forward 逻辑的对象。这种情况下你才能像函数一样调用它：logits = self.gate(hidden_states)。
+
+        # F.linear 的参数是 input, weight, bias，正好对应 y = input * weight + bias。
+        # 这里的 weight 其实在计算时会被转置，因此 hidden_states 是 (T, D)，而 weight.T 则是（D，E），所以最终的 logtis 是 (总Token数, 专家总数)。
         if self.scoring_func == 'softmax':
             scores = logits.softmax(dim=-1)
+            # 将原始分数 logits 转化为概率分布。每个 Token 对所有专家的概率和为 1.0。
+            # 如果 dim=-1：Softmax 会横着算。它取出一个 Token 对所有专家的 N 个分值，把它们变成概率。
+            # 如果 dim=0（错误做法）：Softmax 会竖着算。它会去比较“第 1 个 Token 对专家 A 的分数”和“第 2 个 Token 对专家 A 的分数”，这在逻辑上是毫无意义的。
         else:
             raise NotImplementedError(f'insupportable scoring function for MoE gating: {self.scoring_func}')
 
         topk_weight, topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        # 在前一步，我们算出了每个 Token 对所有专家（比如 8 个）的概率得分。但在 MoE 设计中，我们不想让所有专家都处理每一个 Token（那样太慢了），我们只想选出最适合的那 $k$ 个。
+        # scores 形状是 (Total_Tokens, n_experts)。里面是每个 Token 对应所有专家的概率。
+        # k=self.top_k: 这是一个超参数（通常是 1 或 2）。它告诉 PyTorch：“我只要概率最大的前 $k$ 个”。
+        # dim=-1: 同样是在“专家”这个维度进行选拔。
+        # sorted=False: 这是一个性能优化小技巧。如果为 True，返回的前 $k$ 个结果会按得分从高到低排好序。如果为 False，它只保证抓出最大的 $k$ 个，但不保证这 $k$ 个内部的顺序。在 MoE 中，我们通常不在乎这 $k$ 个谁先谁后，只要选出来就行，所以设为 False 能跑得更快一点。
+
+        # topk_weight (选中的权重):存的是这 $k$ 个专家的原始概率分。例如：某个 Token 对 8 个专家的分数里，最高的两个是 0.85 和 0.10，那么这里就存 [0.85, 0.10]。
+        # topk_idx (选中的索引):存的是这 $k$ 个专家到底是谁（编号）。例如：如果得分最高的是第 3 号和第 7 号专家，这里就存 [3, 7]。
+        # topk_weight 和 topk_idx 的 size 都是（总Token数， topK 专家数）。
 
         if self.top_k > 1 and self.norm_topk_prob:
+            # 当你从所有专家中选出前 $k$ 个后，这几个人的分数加起来往往不等于 1。这段代码通过除以它们的总和，强行让这 $k$ 个人的权重加起来重新等于 100%。
             denominator = topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            # topk_weight.sum(dim=-1, keepdim=True) 表示对选出来的 （总Token数， topK 专家数）按照最后一个维度进行求和。
+            # 由于 tensor.sum() 一般会减少一个维度，因此 keepdim=True 保持维度，方便后面做除法（形状保持为 (Total_Tokens, 1)。
+            # + 1e-20: 这是一个极小的常数（Epsilon），防止万一权重和是 0（虽然 Softmax 后几乎不可能），避免产生“除以零”导致的 NaN 错误。
             topk_weight = topk_weight / denominator
+            # 这里的除法利用了 PyTorch 的 广播机制 (Broadcasting)。
+            # 将 (Total_Tokens, k) 的权重矩阵除以 (Total_Tokens, 1) 的总和矩阵，实现每个 Token 内部权重的重分配。
+
+            # 广播机制会比 for 循环快出了几个数量级。
+            # 在深度学习中，我们有一个原则：能用矩阵运算（向量化）就绝对不用 for 循环。
+            # 广播机制是在底层（C++ 或 CUDA 驱动级）实现的。当你执行 topk_weight / denominator 时，PyTorch 并不会真的在内存里把 denominator 复制一份，它只是在计算时逻辑上把维度对齐，然后直接调用高度优化的 CPU (AVX/SIMD) 或 GPU (Parallel Threads) 指令集。
+            # 而 for 循环是串行的。必须算完第 1 个 Token，才能算第 2 个。如果你有 8192 个 Token，就要排队 8192 次。
+            # 广播 + 矩阵运算是高度并行的。在 GPU 上，成千上万个核心会同时处理这 8192 个 Token 的除法。
 
         if self.training and self.alpha > 0.0:
+            # 只在训练模式下计算 Loss。推理（Inference）时不需要平衡专家。
+            # 只有设置了损失系数（罚款力度）才计算。
             scores_for_aux = scores
+            # scores_for_aux: 缓存所有专家的 Softmax 得分，形状 (Total_Tokens, n_experts)。
+            # 在这里补充一个 python 的基本知识。
+            # Python 没有“块级作用域”（Block Scope）。
+            # 在 Python 中，if/else、for、while、with 等语句块不会开启新的作用域。只有 模块（Module）、类（Class） 和 函数（Function） 才会开启新的作用域。
+
+            # 只要代码运行路径经过了变量定义的赋值语句，该变量在整个函数内部（即 forward 函数内）都是可见的。
+            # Python 查找变量的顺序是：
+            # L (Local)：函数内部。
+            # E (Enclosing)：外部嵌套函数（闭包）。
+            # G (Global)：模块级全局变量。
+            # B (Built-in)：内建函数（如 len, range）。
+            # 由于 if 块属于 Local 作用域的一部分，所以在 if 里面定义的变量，在 if 外面（只要还在同一个函数里）依然是同一个 Local 变量。
+
+            # 虽然 Python 没有块作用域，但它有 “执行路径” 的限制。
+            # def test(condition):
+            # if condition:
+            #     x = 10
+            # print(x)  # 如果 condition 为 False，这里会报 NameError: name 'x' is not defined
+            # 如果进入了 if：x 被赋值，print 没问题。
+            # 如果没进 if：x 压根没被创建，print 就会崩溃。
+
             aux_topk = self.top_k
+            # 计算 aux loss，其中的 aux_topk 用来保存选出的专家数量。
             topk_idx_for_aux_loss = topk_idx.view(bsz, -1)
+            # 将选中的专家索引从 (Total_Tokens, k) 重新折叠回 (Batch_Size, Seq_Len * k)。这是为了方便按“句子”或“序列”来统计。
+
             if self.seq_aux:
+                # 序列级辅助损失，这种模式要求每一条样本（句子）内部都要实现专家均衡。
                 scores_for_seq_aux = scores_for_aux.view(bsz, seq_len, -1)
+                # 将原始得分恢复成三维：(Batch, Sequence, Experts)。
                 ce = torch.zeros(bsz, self.n_routed_experts, device=hidden_states.device)
+                # 创建一个全 0 的计数器，准备记录每个 Batch 里每个专家被选中的次数。
+                # 这里的 n_routed_experts 就是总共的专家个数。
+                # 因此 ce 的 size 为 (Batch, 专家个数)，用来记录每个 batch 触发了哪些专家。
                 ce.scatter_add_(1, topk_idx_for_aux_loss,
                                 torch.ones(bsz, seq_len * aux_topk, device=hidden_states.device)).div_(
                     seq_len * aux_topk / self.n_routed_experts)
+                # scatter_add_ 的三个参数分别是 dim、index、src。
+                # ce 初始形状是 (bsz, n_experts)，全是 0。
+                # index=topk_idx_for_aux_loss 形状是 (bsz, seq_len * k)，存储了每个 Token 选中的专家 ID。
+                # src=torch.ones(...) 产生一堆“1”。
+                # target[i][index[i][j]] += src[i][j]
+
+                # scatter_add_ 这种向量化操作要比 for 循环快上几百倍，甚至上千倍。
+                # 后面的 .div_(seq_len * aux_topk / self.n_routed_experts) 的目的是计算偏离度。
+                # seq_len * aux_topk 代表一整条序列总共发出了多少次“专家邀请”，/ self.n_routed_experts: 这是理想情况。如果雨露均沾，每个专家应该分到这么多任务。
+                # .div_(...): 用实际次数除以理想次数。
+                # 如果某个专家分到的任务正好是平均值，ce 对应位置就是 1.0。
+                # 如果某个专家被冷落（次数为 0），ce 就是 0.0。
+                # 如果某个专家被过度使用，ce 就会 大于 1.0。
+
+                # 在 Pytorch 中 为什么有的方法后缀有一个 _？
+                # 这是一个非常关键的 PyTorch 编程细节。在 PyTorch 中，方法后缀带有一个下划线（如 .div_()、.add_()、.scatter_add_()）表示这是一个 原地操作 (In-place Operation)。
+                # 简单来说，它会直接修改调用它的那个张量（Tensor）本身，而不是创建一个新的张量并返回。
                 aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(dim=1).mean() * self.alpha
+                # ce 的 size 是 (bsz, n_routed_experts)，每行代表一个句子中，各个专家的任务达成率。
+                # 之前的 scores_for_seq_aux size 是 (batch, seq_len, n_routed_experts)。
+                # 执行完 mean(dim=1) 之后，PyTorch 会把每个句子中所有 Token 对专家的概率分加起来，然后除以序列长度。这个操作会消掉 seq_len 这一维。结果 Shape 是 (batch, n_routed_experts)，也就是对于一个 batch 而言，各个 expert 占据的比例，这是根据 batch 内所有 token 的均值算出来的。
+                # 然后再过一个 sum(dim=1)，这里数据的 size 就是 (batch)，每个数据就是专家维度的和，然后经过 mean() 就是每个 batch 的专家平均数。最后的 self.alpha 就是惩罚系数。
+                
+                # 在这里说一下 * 和 @ 区别，对于矩阵而言，* 代表逐个元素进行相乘，而 @ 则是标准矩阵乘法。
+                # 如何从物理意义上理解矩阵乘法 @ ？
+                # 对于 y = x * W，假设 x 是 (1, N), W 是 (N, M)，那么 y 就是 (1, M)。
+                # 物理意义可以这样看：可以把 x 看作是输入特征（比如一张图片的像素或一个单词的向量），而把 W 的每一行看作是一个过滤器（Filter）或模板。
+                # 矩阵乘法的本质是点积。当 $W$ 的某一行与 $\mathbf{x}$ 进行点积时，结果越大，说明 $\mathbf{x}$ 与这一行所代表的特征越相似。
+                # 权重（Weight）的大小决定了输入信号的重要性。大的正权重表示“增强”，负权重表示“抑制”，接近 0 则表示“无视”。
+                # 如果 x 是 X，也就是说他的 size 是 (K,N)，无非输入也只是多一些，真正理解时还是只需要理解 x * W，W 就是对 x 特征的过滤。
+
+                # ce * scores_for_seq_aux.mean(dim=1) 这里就是逐元素相乘，但这不是向量的点积。
+                # ce 的数据源来自于 topk_idx，其 size 为 (bsz, n_routed_experts)。
+                
+                # 那么这里就会引入一个新的问题，ce * scores_for_seq_aux.mean(dim=1) 相乘的物理含义是什么？
+                # 这里的 ce 表示专家分配的实际行动，而 scores 表示专家分配的心理预期。
+                # 将二者的乘积作为 loss，隐式地约束了需要让实际行动和分配心理都要保持均衡，也就是说它只在“大家都挤在一起”的时候，才会产生巨大的惩罚值。如果我们想降低 Loss，我们必须让“大概率”和“大频率”错开。
+                # 结果就是模型为了让 Loss 变小，会被迫学习：即使我主观上很喜欢 1 号专家（概率高），我也要把任务分给 2 号专家一些（降低 1 号的频率）。
+                
+                # 引入的新问题是，为什么不只考虑 ce 或者只考虑 scores？
+
+                # 你可能会问：“直接惩罚那些干活多的专家不就行了？干嘛还要乘以概率？”，这是因为scores（概率）是可导的，而 ce（计数）是通过索引拿到的，通常不可导。通过乘以 scores，Loss 就可以通过反向传播（Backpropagation）来修改门控器的权重，从而改变未来的分配倾向。如果没有这个乘法，梯度就断了，模型就不知道该怎么调整自己。
+
+                # 那为什么不只考虑 scores 呢？反正只有 scores 也足够反向传播了。在这里就要说明一种情况，也就是思想上公平，但是行动不公平，即 scores 比较均衡，但是 ce 不均衡。出现这种情况的本质原因是 topk << 专家个数。
+                # 首先，scores (思想) 是连续的。在 $0.0$ 到 $1.0$ 之间有无限的可能。topk (行动) 是离散的。它是一个 0/1 决策：要么你被选中（1），要么你被抛弃（0）。当你把一个连续的分布强行塞进一个“只选前 k 个”的黑盒里时，你实际上是把 N-k 个专家的生存权利直接抹杀了。即使某个专家在思想上拿到了 12% 的好感度（仅次于前两名的 13%），在行动上它拿到的也是 0。
+                # 这就是 k << N 带来的必然结果，大量“还不错”的专家因为微弱的排名劣势，在宏观统计上被彻底边缘化了。
+
+                # 思想公平只是模型的一种“态度”，行动不公平则是由于 k << N 这种稀疏筛选机制造成的“残酷现实”。如果不引入 ce 这种外部约束，模型就会像一个只看名次不看分数的面试官，永远只录用那两名“面霸”，而让其他同样优秀的专家（MLP 层）在冷宫里因得不到训练而逐渐“废掉”。
             else:
+                # 全局辅助损失，它不关心单个句子内部是否均衡，而是要求**整个 Batch（所有 Token 放在一起）**对专家的调用是均匀的。
                 mask_ce = F.one_hot(topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts)
+                # F.one_hot 的作用是生成一个 one-hot 矩阵，他的 row size 就是 topk_idx_for_aux_loss.view(-1) 的 size，也就是 total_token * k，one-hot 的 col size 就是 num_classes，这里也就是专家个数。
+                # 具体来说，对应某一行，比如有 4 个专家，Token 选了 #2，就变成 [0, 0, 1, 0]。
                 ce = mask_ce.float().mean(0)
+                # 首先将 mask_ce 由 int 转化为 float 数据，这是由于在 PyTorch 中，整型是不能做平均值（mean）计算的。
+                # 然后进行 mean(dim=0) 的运算，这会再 row 维度进行求均值，size 由 (total_token, experts_num) 变成 experts_num。
+                # 这行代码把**“谁选了谁”这种琐碎的个体信息，提炼成了“每个专家干了百分之几的活”**这种全局统计信息。
                 Pi = scores_for_aux.mean(0)
+                # scores 形状是 (Total_Tokens, n_experts)。里面是每个 Token 对应所有专家的概率。
+                # 做了 mean(dim=0) 之后求出来的就是每个专家的概率。
+                # 这代表了门控器对这批数据主观上分配概率的平均值。
                 fi = ce * self.n_routed_experts
+                # 在理想的绝对平均情况下，每个专家应该拿到 1/N 的流量。
+                # 乘以 N 之后，理想情况下的 fi 每个元素都应该是 1.0。如果某个专家拿了 2 倍的流量，fi 就是 2.0；如果没拿到，就是 0.0。这步操作将“占比”转化为了“偏离倍数”。
                 aux_loss = (Pi * fi).sum() * self.alpha
+                # Pi * fi: 还是那个逻辑——“我想给谁”乘以“我真给了谁”。
+                # .sum(): 将所有专家的这个乘积加起来。
+
+                # 无论是哪个序列级还是全局级，它们最终都在算同一个公式：
+                # Loss = \alpha \cdot N \cdot \sum_{i=1}^{N} P_i \cdot f_i
+                # 其中 $P_i$ 是预测概率平均值，$f_i$ 是实际频率。当 $P$ 和 $f$ 都是均匀分布时，这个值达到最小。
+
+                # 什么时候用序列级，什么时候用全局级？
+                # 序列级 Loss (Sequence-level)核心逻辑是强制**每一个句子（样本）**内部都要公平地分配专家。适用情况为：
+                # - 处理长文本（Long Context）。在长文本中，一个序列（Sequence）可能包含数千个 Token。如果这一个序列就塞满了某一个专家的缓冲区（Capacity），会导致该序列的处理速度极慢。序列级 Loss 强制长文本在内部就把流量摊开。
+                # - 训练初期（Warm-up 阶段）。在模型刚开始学习时，专家非常容易“塌陷”（所有 Token 都涌向同一个随机初始化较好的专家）。序列级 Loss 约束更严，能强迫模型在每一个样本处理时都去尝试不同的专家，加速专家多样性的开发。
+                # - 推理延迟敏感场景。如果你的线上服务 Batch Size 很小（甚至为 1），你必须保证单个请求（Sequence）能够均匀触发多个专家并行工作，而不是串行等待一个专家。
+                # 缺点是违背自然语义，有些短句子可能真的只涉及单一主题（比如全是金融词汇），强制它分给 8 个专家（包括文学专家、代码专家）会降低精度，属于“强行摊派”。
+
+                # 全局级 Loss (Global-level)的核心逻辑是不限制单个句子，只要整个 Batch（成百上千个 Token）看过去是平的就行。适用情况为：
+                # - 大规模预训练（Pre-training）。在极大的 Batch Size 下（例如 400 万个 Token 一个 Step），只要宏观上专家是平衡的，吞吐量（Throughput）就是最高的。它允许模型根据语义灵活选择：句子 A 全部给专家 #1，句子 B 全部给专家 #2。
+                # - 多任务/多语言训练。不同任务的 Token 分布天然不同。全局 Loss 允许专家“术业有专攻”。比如代码专家的活全来自于 Batch 里的代码样本，而不用强行去分担翻译样本的活。
+                # - 分布式专家并行（Expert Parallelism）。在模型跨机器分布时，我们更在乎的是总流量是否塞满了 8 张显卡的显存，而不是某一行数据在显卡间的跳跃。
+                # 缺点是极端不均风险，如果 Batch 里的句子同质化严重（比如全是同一种风格的垃圾文本），全局 Loss 可能在宏观上觉得平衡，但微观上依然导致某些计算节点过载。
         else:
             aux_loss = scores.new_zeros(1).squeeze()
+            # 这是一种防御性编程。
+            # 它确保了无论在什么条件下（训练还是推理、单卡还是多卡），aux_loss 永远是一个格式正确、位置正确、数值为 0 的有效对象。
+            # 1. 首先他保证了变量作用域的正确性。
+            # 2. 其次是为了保证计算图的一致性，在 PyTorch 中，损失函数通常需要参与 total_loss = loss + alpha * aux_loss 的加法运算。
+            # * 如果 aux_loss 是 None：加法会报错。
+            # * 如果 aux_loss 是普通数字 0：虽然能加，但在某些分布式训练框架中，它可能因为不是 Tensor 而导致同步错误。
+            # * 用 new_zeros：它返回的是一个带梯度的 Tensor 占位符。即使它是 0，它也是一个**“合法公民”**，可以顺畅地参与所有矩阵运算。
+            # 3. 需要保证 aux_loss 是位于同一个 GPU 上，并且数据类型和 scores 一致，float 才能用于反向传播。squeeze() 是为了保证最后的 loss 是一个 tensor 张量，和之前的 loss 保持一致。
         return topk_idx, topk_weight, aux_loss
+        # topk_idx 存的是这 $k$ 个专家到底是谁（编号）。
+        # topk_weight (选中的权重):存的是这 $k$ 个专家的原始概率分。例如：某个 Token 对 8 个专家的分数里，最高的两个是 0.85 和 0.10，那么这里就存 [0.85, 0.10]。
+        # aux_loss 就是专家负载均衡损失。
 
 # 混合专家前馈
 class MOEFeedForward(nn.Module):
@@ -371,7 +548,7 @@ class MOEFeedForward(nn.Module):
             FeedForward(config)
             for _ in range(config.n_routed_experts)
         ])
-        # nn.ModuleList 是一个特殊的列表，用于存储 PyTorch 子模块。如果你用普通的 Python list，PyTorch 就找不到里面的参数，导致无法训练。
+        # nn.ModuleList 是一个特殊的列表，用于存储 PyTorch 子模块。如果我们用普通的 Python list，PyTorch 就找不到里面的参数，导致无法训练。
         # experts 就是一个个的 FeedForward。每一个“专家”本质上就是一个标准的前馈神经网络（通常是两层全连接加一个激活函数）。
         # config.n_routed_experts 通过循环创建了指定数量的专家（例如 8 个或 16 个）。这些专家被称为“被路由的”，因为输入数据会根据权重选择性地进入其中的某几个。
         self.gate = MoEGate(config)
@@ -415,11 +592,11 @@ class MOEFeedForward(nn.Module):
         if self.training:
             x = x.repeat_interleave(self.config.num_experts_per_tok, dim=0)
             # torch.repeat_interleave 的作用是对张量中的元素进行“就地连续重复”
-            # 假设你有一排人 [A, B, C]。普通的 repeat(2)（整体复制）结果是 [A, B, C, A, B, C]（排两次队）。repeat_interleave(2)（就地重复）结果是 [A, A, B, B, C, C] （每个人原地变出个双胞胎）。
+            # 假设我们有一排人 [A, B, C]。普通的 repeat(2)（整体复制）结果是 [A, B, C, A, B, C]（排两次队）。repeat_interleave(2)（就地重复）结果是 [A, A, B, B, C, C] （每个人原地变出个双胞胎）。
             # 这里为什么要执行 repeat_interleave？
             # 任务分配，如果每个 Token 要交给 2 个专家（top-2），那么每个 Token 必须有 2 份实体。
             # 索引对齐，x 经过重复后变成了：[T1, T1, T2, T2, T3, T3, ...]，而我们的 flat_topk_idx（拉平后的专家索引）也是 [专A, 专B, 专C, 专D, ...] 这样第 0 个的 T1 对应的就是 专A，第 1 个的 T1 对应的就是 专B。
-            # 如果没有这一步，你的数据量（Token 数）就对不上专家索引的数量（Token 数 $\times$ k），程序就会因为维度不匹配直接报错。
+            # 如果没有这一步，我们的数据量（Token 数）就对不上专家索引的数量（Token 数 $\times$ k），程序就会因为维度不匹配直接报错。
             y = torch.empty_like(x, dtype=x.dtype)
             # 创建一个与输入张量 x 形状、设备（CPU/GPU）完全一致的“空容器”，用来存放专家们计算出来的结果。
             for i, expert in enumerate(self.experts):
@@ -448,7 +625,7 @@ class MOEFeedForward(nn.Module):
                 # Dense 模型 (如 Mistral 7B)：FFN 维度是 14336。
                 # MoE 模型 (如 Mixtral 8x7B)：它有 8 个专家，每个专家的 FFN 维度依然是 14336。
                 # 从计算成本角度看，虽然总参数量达到了 47B，但每个 Token 只选 2 个专家计算，所以它的计算量只相当于一个 12B 左右的 Dense 模型。
-                # 结果是你用 12B 的推理速度，获得了一个接近 50B 规模模型的智商。
+                # 结果是我们用 12B 的推理速度，获得了一个接近 50B 规模模型的智商。
                 if expert_out.shape[0] > 0: 
                     # expert_out 是动态的，因为每个专家被分到的 token 数会变化，假设分到的 token 数是 M 个，那么 expert_out 的形状就是 (M, 4096)，也就是普通 ffn 的输出结果。
                     # expert_out.shape[0] > 0 就代表 M > 0，也就是分到了一个 token。
@@ -477,7 +654,7 @@ class MOEFeedForward(nn.Module):
                     # output = expert(input)
                     # print(output.grad_fn)
                     # 如果输出类似 <AddBackward0...>, 说明它在图中。如果输出 None, 说明它是一个孤立的叶子节点，断路了。
-                    # 以下几种常见情况，即使你写了代码，参数也没有进入计算图：
+                    # 以下几种常见情况，即使我们写了代码，参数也没有进入计算图：
                     # 1. 脱离张量操作。y = x + expert.weight.item()，.item()提取了 Python 数值，丢失了所有梯度跟踪信息。
                     # 2. 原地/非跟踪赋值。with torch.no_grad(): y = expert(x)，明确告诉框架不要记录这一段的操作。
                     # 3. 索引为空。y[False] = expert(x)，赋值操作未发生，专家参数与 y 之间没有建立逻辑指针。
@@ -600,7 +777,7 @@ class MOEFeedForward(nn.Module):
             # 1. target：最终要汇总的大表（收纳盒）。
             # 2. dim：沿着哪个维度分发（通常 0 代表行，1 代表列）。
             # 3. index：地址清单（标签），形状必须和 src 一致。
-            # 4. src：你要分发的数据源（零件）。
+            # 4. src：我们要分发的数据源（零件）。
             # 因此本质上就等效于 target[index, :] += srcp[index, :]。
 
             # exp_token_idx.view(-1, 1).repeat(1, x.shape[-1]) 就是 index，他的用法是：
@@ -658,9 +835,9 @@ class MiniMindBlock(nn.Module):
         # 如果采用了 FeedForward，那么就是 Dense 模型，例如 GPT-3、Llama-2。
         # 如果模型中引入了 MOEFeedForward，它就变成了 MoE（混合专家）模型。
 
-        # 选 Dense：如果你追求部署极其简单、显存资源有限，或者模型规模在 7B 以下。在小参数量级下，MoE 的路由开销和训练复杂度可能并不划算。而且 Dense 模型的训练稳定性比较高，且由于参数总量通常比 MoE 小，对显存总量的要求更低。
+        # 选 Dense：如果我们追求部署极其简单、显存资源有限，或者模型规模在 7B 以下。在小参数量级下，MoE 的路由开销和训练复杂度可能并不划算。而且 Dense 模型的训练稳定性比较高，且由于参数总量通常比 MoE 小，对显存总量的要求更低。
 
-        # 选 MoE：如果你想做 SOTA（业界领先） 效果，且有足够的存储资源。MoE 允许你在保持 10B 级别推理速度的同时，拥有 50B 甚至 100B 级别的知识储备（Knowledge Capacity）。此外，不同的专家可以专注于不同的领域（如逻辑推理、创意写作、代码）。这种分工理论上能比同等计算量的 Dense 模型达到更高的上限。
+        # 选 MoE：如果我们想做 SOTA（业界领先） 效果，且有足够的存储资源。MoE 允许我们在保持 10B 级别推理速度的同时，拥有 50B 甚至 100B 级别的知识储备（Knowledge Capacity）。此外，不同的专家可以专注于不同的领域（如逻辑推理、创意写作、代码）。这种分工理论上能比同等计算量的 Dense 模型达到更高的上限。
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
         residual = hidden_states
@@ -760,7 +937,7 @@ class MiniMindModel(nn.Module):
         # 将整数形式的 input_ids 映射为稠密的向量（Embedding），并应用 Dropout（如果配置了的话）来防止过拟合。
         # 哪些层会调用 self.dropout？
         # 在一个完整的 Transformer 架构中，Dropout 通常会出现在以下三个关键位置：
-        # 1. Embedding Dropout。在词向量叠加位置编码后执行（即你代码中的位置），防止模型过度依赖某些特定的词维度。
+        # 1. Embedding Dropout。在词向量叠加位置编码后执行（即我们代码中的位置），防止模型过度依赖某些特定的词维度。
         # 2. Attention Dropout。在计算 Attention Score（$Softmax$ 之后）执行，随机让某些注意力权重失效，防止模型只关注局部特征。
         # 3. Residual Dropout。在每个子层（Attention 或 MLP）的输出加回残差连接之前执行，这是最常用的正则化手段。
         # 现代大模型（如 Llama 3）为了训练稳定性，往往会减少甚至移除这些 Dropout，转而依赖更大的数据量和更强的正则化手段（如权重衰减）。
@@ -874,18 +1051,18 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     # 继承自 PreTrainedModel（处理模型加载、保存、权重初始化）和 GenerationMixin（赋予模型 .generate() 方法进行文本生成的能力）。
 
     # PreTrainedModel 可以让我们不去写大量的样本代码，包括了：
-    # 序列化与加载 (save_pretrained / from_pretrained)。继承后，你可以直接通过 model.save_pretrained("./path") 保存模型，或者用 MiniMindForCausalLM.from_pretrained("repo_id") 从云端下载。它会自动处理权重转换、分片加载和版本校验。
-    # 权重初始化。它定义了 init_weights() 的标准流程。当你新建模型时，它能确保所有的 Linear 层、Embedding 层按照科学的高斯分布或 Xavier 分布初始化，而不是随机乱序。
-    # 设备管理。让你能轻松使用 .to("cuda")、.half()（半精度）或配合 accelerate 库进行分布式训练。
+    # 序列化与加载 (save_pretrained / from_pretrained)。继承后，我们可以直接通过 model.save_pretrained("./path") 保存模型，或者用 MiniMindForCausalLM.from_pretrained("repo_id") 从云端下载。它会自动处理权重转换、分片加载和版本校验。
+    # 权重初始化。它定义了 init_weights() 的标准流程。当我们新建模型时，它能确保所有的 Linear 层、Embedding 层按照科学的高斯分布或 Xavier 分布初始化，而不是随机乱序。
+    # 设备管理。让我们能轻松使用 .to("cuda")、.half()（半精度）或配合 accelerate 库进行分布式训练。
 
     # GenerationMixin。forward 函数只负责计算一次前向传播，并不负责推理生成。
-    # 自动推理循环。文本生成是一个自回归过程（预测词 A -> 把 A 加入输入 -> 预测词 B）。继承 GenerationMixin 后，你就拥有了强大的 .generate() 方法。
-    # 内置高级搜索算法。你不需要自己写代码，就能直接使用Beam Search（束搜索）、Top-K / Top-P Sampling（核采样）、Temperature（温度调节）、阻止重复（Repetition Penalty）、KV Cache 管理。
+    # 自动推理循环。文本生成是一个自回归过程（预测词 A -> 把 A 加入输入 -> 预测词 B）。继承 GenerationMixin 后，我们就拥有了强大的 .generate() 方法。
+    # 内置高级搜索算法。我们不需要自己写代码，就能直接使用Beam Search（束搜索）、Top-K / Top-P Sampling（核采样）、Temperature（温度调节）、阻止重复（Repetition Penalty）、KV Cache 管理。
     # 它会自动处理 past_key_values 的传递，让生成速度提升数倍。
     config_class = MiniMindConfig
     # 在 Hugging Face 的框架下，它是必须的。
     # config_class：指定该模型使用的配置类，包含隐藏层维度、层数等超参数。
-    # 当你调用 from_pretrained 时，程序会先读取 config.json。通过这个声明，程序才知道该用 MiniMindConfig 这个类去解析这个 JSON 文件。
+    # 当我们调用 from_pretrained 时，程序会先读取 config.json。通过这个声明，程序才知道该用 MiniMindConfig 这个类去解析这个 JSON 文件。
 
     def __init__(self, config: MiniMindConfig = None):
         self.config = config or MiniMindConfig()
@@ -915,7 +1092,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
                 #         torch.randn(1, 4, 3, 8)  # Value 张量
                 #     )
                 # ]
-                # 当你生成第 4 个词（比如“他”）时，你会把这个结构传给模型。模型计算完后，会返回一个新的 past_key_values。新的数据结构依然是 List 包含 Tuple，但张量的形状会发生变化：
+                # 当我们生成第 4 个词（比如“他”）时，我们会把这个结构传给模型。模型计算完后，会返回一个新的 past_key_values。新的数据结构依然是 List 包含 Tuple，但张量的形状会发生变化：
                 # 输入时：形状是 [1, 4, 3, 8]
                 # 输出时：形状变成了 [1, 4, 4, 8] （第 3 维从 3 变成了 4，因为多记了一个词）。
                 use_cache: bool = False,
@@ -945,7 +1122,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         # 为什么要去裁剪呢？简单来说，裁剪（Slicing）是为了“只算有用的，省下没用的”。
         # 从推理的角度来看，由于使用了 KV Cache（past_key_values），模型每一轮 forward 实际上只需要关注当前最新输入的那一个词。
-        # 如果不裁剪 lm_head 会计算这 2000 个词每一个词对应的 Logits（预测下一个词的分数）。但实际上，前 1999 个词对应的预测结果你根本不需要，因为它们已经是过去式了。
+        # 如果不裁剪 lm_head 会计算这 2000 个词每一个词对应的 Logits（预测下一个词的分数）。但实际上，前 1999 个词对应的预测结果我们根本不需要，因为它们已经是过去式了。
         # 如果裁剪 (logits_to_keep=1)，通过 slice(-1, None)，模型只取最后一个特征向量喂给 lm_head。计算量骤降，速度提升，且节省了巨大的中间显存。
 
         # 从训练的角度来看，在训练时，虽然我们要处理整个序列，但并不是所有位置的输出都对“学习”有贡献。
@@ -966,7 +1143,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
 
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         # CausalLMOutputWithPast 是 Hugging Face transformers 库定义的一个标准数据类（Dataclass）。
-        # 如果返回 (loss, logits, ...)，你必须死记硬背顺序（第 0 位是 Loss，第 1 位是 Logits）。而使用了这个对象后，调用者可以通过属性名直接访问，代码可读性极高。
+        # 如果返回 (loss, logits, ...)，我们必须死记硬背顺序（第 0 位是 Loss，第 1 位是 Logits）。而使用了这个对象后，调用者可以通过属性名直接访问，代码可读性极高。
         # 除了装入 loss、logits、past_key_values 和 hidden_states 以外，还把 MoE 的 aux_loss 也装进去了。
         output.aux_loss = aux_loss
         return output
