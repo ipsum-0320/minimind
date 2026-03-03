@@ -291,18 +291,49 @@ class Attention(nn.Module):
 
 # 简单前馈网络
 class FeedForward(nn.Module):
+    # 定义一个类，继承自 PyTorch 的基础模型类 nn.Module。
+    # 这个 FeedForward 其实就是一个 SwiGLU 结构，它是由两个组件组合而成：
+    # - GLU (Gated Linear Unit)：指代那种“两路并行再相乘”的结构（$A \otimes B$）。
+    # - Swish (SiLU)：指代 gate_proj 之后用的那个特定的激活函数。
+
+    # SwiGLU 的信息流向如下：
+    # 1. x 流向 Up，同时 x 流向 Gate。
+    # 2. Gate 的流出进入 silu，然后 silu 的结果和 up 的流出进行点乘。
+    # 3. 最后的结果流出 Down。
+    # 总体为 FFN_{SwiGLU}(x) = (Swish(xW_{gate}) \otimes xW_{up})W_{down}
+
     def __init__(self, config: MiniMindConfig):
+        # 传入一个配置对象，里面包含了模型的所有超参数（如维度、激活函数类型等）。
         super().__init__()
         if config.intermediate_size is None:
+            # 如果没有手动指定中间层维度（intermediate_size），则自动计算。
             intermediate_size = int(config.hidden_size * 8 / 3)
+            # 大模型（如 Llama）常用 hidden_size \times \frac{8}{3} 作为中间层宽度。
             config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+            # 最后的计算是为了确保维度是 64 的倍数。这有助于 GPU 利用内存对齐（Memory Alignment）来加速计算。
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # “门控”层。将输入向量放大，准备通过激活函数产生“开关”信号。
+        # 他的本质作用就是去实现条件过滤，up_proj 负责产生候选特征（大量的原始信息）。gate_proj 经过激活函数（SiLU）后，产生一个掩码（Mask）。
+        # 当两者相乘时，如果 gate_proj 在某个位置输出接近 0，那么 up_proj 在该位置提取的特征就会被“杀掉”；如果接近大于 0，则允许通过。
+        # 通俗点说，up_proj 是“可能有用的信息”，而 gate_proj 是根据当前上下文判断“哪些信息真的有用”。
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        # “下降”层。将处理后的复杂特征映射回原始维度，保持特征维度一致。
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # “上升”层。同样放大向量，存储主要的特征信息。
+        # up_proj 可以从原来的 hidden_size 中，经过参数的组合变化，提取出更多的特征。
+        # 所有的 Linear 都不使用 Bias，这是目前大语言模型的通用做法，可以减少参数并微弱提升训练稳定性。
         self.dropout = nn.Dropout(config.dropout)
-        self.act_fn = ACT2FN[config.hidden_act]
+        # 随机丢弃一部分神经元防止过拟合。
+        self.act_fn = ACT2FN[config.hidden_act] # silu。
+        # 激活函数（通常是 SiLU，也叫 Swish）。ACT2FN 是一个字典，根据字符串映射到具体的函数。
 
     def forward(self, x):
+        # # 1. gate_proj(x) -> 线性变换
+        # 2. act_fn(...) -> 经过 SiLU 激活，产生 0 到 1 之间的权重（门控信号）
+        # 3. up_proj(x) -> 另一个线性变换，获取特征
+        # 4. * -> 两者逐元素相乘。门控信号决定了特征中哪些部分该“通过”
+        # 5. self.down_proj(...) -> 将维度压回 hidden_size
+        # 6. self.dropout(...) -> 应用随机失活
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
 # 混合专家的路由门控
