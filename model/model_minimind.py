@@ -148,15 +148,40 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 
 # 规范化层
 class RMSNorm(torch.nn.Module):
+    # 这段代码实现了 RMSNorm (Root Mean Square Layer Normalization)，这是一种在 Llama 等大语言模型中广泛使用的归一化技术。它的核心思想是：与其像 LayerNorm 那样进行“平移和缩放”，不如只进行“缩放”。
+    # LayerNorm 执行了两步操作：平移（减去均值 $\mu$）和 缩放（除以标准差 $\sigma$）。
+    # RMSNorm 只执行了一步操作：缩放（除以均方根）。它直接去掉了减去均值（Centering）的过程，也没有偏置项 $\beta$。
+
+    # LayerNorm 的可学习参数有两个，而 RMSNorm 的可学习参数只有一个。
+    # 因此前者计算开销较高（需计算均值和方差），后者计算开销较低（计算更简单，速度快）。
     def __init__(self, dim: int, eps: float = 1e-5):
+        # 初始化函数。dim 是输入的维度（通常是隐藏层大小），eps 是一个极小的正数，防止除以零。
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
+        # 定义一个可学习的缩放参数 $\gamma$（Scale）。初始化全为 1。注意：RMSNorm 通常没有 Bias（偏移参数）。
+        # nn.Parameter 初始化为 1 是为了在训练开始时，让 RMSNorm 处于“透明状态”，即不改变经过归一化后的信号强度。
     def _norm(self, x):
+        # 定义核心的归一化逻辑。
+        # x.pow(2).mean(-1, keepdim=True)，计算最后一个维度上每个元素的平方的平均值（均方值）。在 PyTorch 中，x.pow(2) 是一个 Element-wise（逐元素） 操作。
+        # torch.rsqrt(... + self.eps)，对均方值加上 eps 后开根号再取倒数，即 \frac{1}{\sqrt{Mean(x^2) + \epsilon}}。
+
+        # 整个 RMSNorm 的过程为：
+        # 1. 假设输入的是 x = \begin{bmatrix} 
+                            # 3 & 4 & 0 \\
+                            # 1 & 1 & 1 
+                            # \end{bmatrix}
+        # 2. 那么就会按照行去计算均值，得到结果。
+        # 3. 然后按照广播进行逐元素的乘法（这里是乘一个倒数，因此就是乘法）。
+        # 这里的 torch.rsqrt 就是开根号再取倒数
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        # keepdim=True 的核心作用就是保持维度对齐，从而触发 PyTorch 的广播机制（Broadcasting），rsqrt 结果是 (32, 128, 1)。
 
     def forward(self, x):
+        # x.float() 用来强制转换为 float32 以保证计算精度，防止半精度（float16）溢出。
+        # self._norm(...) 用来执行归一化。
+        # self.weight * ...：将归一化后的结果乘以可学习参数 weight。
+        # .type_as(x)：将结果转换回输入 x 的原始数据类型（如 bfloat16）。
         return self.weight * self._norm(x.float()).type_as(x)
 
 # RoPE 位置编码预计算
