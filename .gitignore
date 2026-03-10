@@ -4,3 +4,4 @@ website/
 docs-minimind/
 .idea/*
 .qoder/*
+*.jsonl
