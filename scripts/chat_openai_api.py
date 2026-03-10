@@ -1,3 +1,8 @@
+# 一个简单的命令行聊天界面，通过 OpenAI 兼容的 API 与 MiniMind 模型进行交互
+# 支持流式输出（stream=True），可以实时显示模型的回复
+# 支持对话历史管理，可以配置是否携带之前的对话内容
+# 连接到本地的 Ollama 服务（http://127.0.0.1:8998/v1）
+
 from openai import OpenAI
 
 client = OpenAI(

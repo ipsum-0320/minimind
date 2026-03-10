@@ -1,3 +1,11 @@
+# 一个图形化的聊天演示界面，支持的功能如下 =>
+# 本地模型加载和推理
+# 远程 API 调用（通过 OpenAI 兼容接口）
+# 多轮对话历史管理
+# 模型参数调整（温度、序列长度、历史对话数）
+# 对话内容可视化和删除功能
+# 支持 R1 推理模型的思考内容展示
+
 import random
 import re
 from threading import Thread
