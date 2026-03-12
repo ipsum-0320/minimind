@@ -51,6 +51,7 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
+    # cosine 学习率计算。
     return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
 
 

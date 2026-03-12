@@ -6,7 +6,11 @@ from datasets import load_dataset
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
+    # add_system_ratio 一个概率值，表示有 20% 的概率会给这条对话加上系统提示词。
+    # 如果你的训练集里全是用户问、助手答，模型可能不知道自己叫什么。通过这种方式，你强行把 "minimind" 这个名字刻进了模型的记忆里。
     SYSTEM_PROMPTS = [
+        # 这包含了一组预定义的身份描述（中英文都有）。
+        # 核心目的是通过训练，让模型“记住”自己叫 minimind，并设定其语调（专业、友好、可靠）。
         "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
         "你是minimind，一个小巧但有用的语言模型。",
         "你是一个专业的AI助手，请提供有价值的回答。",
@@ -20,13 +24,28 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
     ]
     if conversations and conversations[0].get('role') != 'system':
         if random.random() < add_system_ratio:
+            # 为什么要随机？ 如果 100% 都加，模型可能会产生依赖，没有系统提示词就不会说话了；保持一定比例的随机，能让模型更鲁棒。
+            # 这里回答两个问题：
+            # 1. 为什么要在 SFT 数据集中添加 System Prompt？
+            # A：大模型本质上是概率预测。如果不告诉它“你是 MiniMind”，它可能会根据训练数据里残余的信息，一会儿觉得自己是 GPT-4，一会儿觉得自己是文心一言。通过反复训练包含“你是 MiniMind”的 Prompt，模型会建立起牢固的自我认同。
+            # 2. 为什么要“随机”加（Why Random?）
+            # 如果模型只见过带 System Prompt 的数据，当你实际使用时，万一忘写了 System Prompt，或者用户直接问“你好”，模型可能会因为找不到那个“启动开关”而变得语无伦次，甚至拒绝回答。随机添加能训练模型在有或没有系统指令的情况下都能正常工作。
             return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
     return conversations
+# System Prompt 是在 SFT 阶段被“教会”的，但在推理阶段被“激活”使用。
+# 一般来讲，System Prompt 不会在 pretrain 阶段加入，只会在 SFT 阶段加入，尤其是指令微调阶段。
 
 def post_processing_chat(prompt_content, empty_think_ratio=0.05):
+    # 这行在检查字符串中是否包含一个完全没有内容的思考标签。只有当随机数大于 0.05 时（即 95% 的概率），才会进入删除逻辑。
+    # 换句话说，有 5% 的概率，即使思考块是空的，我们也会原样保留它。
     if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
         prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
+        # 把那个占地方但没内容的 <think>\n\n</think>\n\n 彻底删掉，让 Prompt 变得更紧凑。
     return prompt_content
+# 这段代码的目的：
+# 1. 如果你的模型模板里默认带了 <think> 标签，但在某些对话中（比如简单的打招呼），模型并没有产生实际的思考逻辑。保留一对空的 <think> 标签会白白占用 Token 位。删掉它们可以减少显存占用，提高推理/训练效率。
+# 2. 为什么要 5% 的保留？一是如果训练数据里 100% 的空思考块都被删掉了，模型可能会产生一种错觉：“只要出现 <think> 标签，里面就必须有字”。
+# 二是保留 5% 的空块，是告诉模型：“有时候我也可能只是想了一下但啥也没想出来，这也是正常的。”这样模型在推理遇到空块时，不会因为没见过这种格式而崩掉。
 
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
@@ -156,20 +175,35 @@ class SFTDataset(Dataset):
 
         sample = self.samples[index]
         # 从 load_dataset 加载好的数据集对象中，取出索引为 index 的那一条原始 JSON 数据。
-
+        # 这里的 sample 如下所示：
+        # {"conversations": [{"role": "user", "content": "你好，我是第一次使用你们的平台，我该怎么使用你来帮助我解决问题呢？"}, {"role": "assistant", "content": "你好！很高兴能为你提供帮助。使用我来解决问题非常简单，你只需要告诉我你遇到的具体问题或需要帮助的领域，比如学习、工作、技术问题、生活建议等。我会根据你的需求，提供相应的信息、建议或解决方案。如果你有任何疑问，或者需要更具体的指导，也可以随时向我提问。现在，你可以告诉我你具体需要帮助的内容了。"}]}
         
-        conversations = pre_processing_chat(sample['conversations'])
-        prompt = self.create_chat_prompt(conversations)
-        prompt = post_processing_chat(prompt)
+        conversations = pre_processing_chat(sample['conversations']) # 加入 System Prompt。
+        prompt = self.create_chat_prompt(conversations) # 将 conversations 加上 bos、eos 等 special token。
+        prompt = post_processing_chat(prompt) # 去除空思考标签。
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        # token 化，同时去除超出的部分。
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        # 如果对话比较短，不足 max_length，就在列表末尾填充 pad_token_id（通常是 0）。
+        # 目的是矩阵整齐化。在 GPU 计算时，同一个 Batch（批次）里的所有数据必须长度一模一样，模型才能像处理表格一样并行计算。
+        # 结果就是现在 input_ids 的长度不多不少，正好等于 max_length。
+
+        # 这里的将 input_ids 拼接成 max_len 是为了和别的样本保持对齐，实现静态填充。
+        # 在 __getitem__ 运行完后，DataLoader 会调用一个叫 collate_fn 的函数，把多个样本堆叠（Stack）在一起。如果样本 A 长度是 100，样本 B 长度是 200，它们是没法拼成一个长方形矩阵的。
+        # 但是这种静态填充比较浪费 GPU，还有一种方法是在 __getitem__ 里不补齐（让每个样本保持原始长度），然后在 DataLoader 的 collate_fn 阶段，根据当前这个 Batch 里最长的那条数据动态地补齐。这叫 Dynamic Padding。这样做的好处是如果一个 Batch 里大家都短，那就只对齐到短的长度，训练速度能提升好几倍！
+
         labels = self.generate_labels(input_ids)
+        # 将刚刚准备好的、整齐的 input_ids 丢进我们之前讨论过的 generate_labels 函数里。
+        # 产出得到一个同样长度为 max_length 的 labels 列表。
+        # 这个列表里，用户问题对应的位置全是 -100（被掩盖），只有助手回答的部分是真实的数字 ID。
+
         # # === 调试打印 ===
         # print(f"\n--- Sample {index} ---")
         # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
         return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        # 返回最终的结果，input_id 都是整数。 
 
 
 class DPODataset(Dataset):
