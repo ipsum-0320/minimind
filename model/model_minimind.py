@@ -1368,7 +1368,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.model.embed_tokens.weight = self.lm_head.weight
         # 权重共享，最后一行将 Embedding 层的权重与输出层的权重设为同一个。这是一种常用的正则化手段，可以大幅减少模型参数量并提升效果。
 
-    # 这里的 forward 的函数即是训练代码又是推理代码。
+    # 这里的 forward 的函数即是训练代码又是推理代码，这里的 forward 参数在调用 model.generate() 是会被传入的。
     def forward(self,
                 input_ids: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
@@ -1419,9 +1419,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         # 如果不裁剪 lm_head 会计算这 2000 个词每一个词对应的 Logits（预测下一个词的分数）。但实际上，前 1999 个词对应的预测结果我们根本不需要，因为它们已经是过去式了。
         # 如果裁剪 (logits_to_keep=1)，通过 slice(-1, None)，模型只取最后一个特征向量喂给 lm_head。计算量骤降，速度提升，且节省了巨大的中间显存。
 
-        # 从训练的角度来看，在训练时，虽然我们要处理整个序列，但并不是所有位置的输出都对“学习”有贡献。
-        # 指令微调（SFT），通常我们会输入一个 Prompt（问题）和一个 Answer（回答）。在 SFT 中，我们通常只计算 Answer 部分的 Loss。因为问题是给定的，模型不需要学习如何生成问题。
-        # 假设序列总长 4000，其中问题 3500 词，回答 500 词。如果不裁剪，模型会生成一个 [Batch, 4000, 128000] 的巨型 Logits 张量。这在 FP32 精度下大约占用 2GB/样本。如果 Batch Size 是 8，光这一个变量就要 16GB 显存，直接导致显卡崩溃（OOM）。如果裁剪 (logits_to_keep=500)，通过 slice(-500, None)，模型只计算最后 500 个回答词的 Logits。
+        # ~~从训练的角度来看，在训练时，虽然我们要处理整个序列，但并不是所有位置的输出都对“学习”有贡献。~~
+        # ~~指令微调（SFT），通常我们会输入一个 Prompt（问题）和一个 Answer（回答）。在 SFT 中，我们通常只计算 Answer 部分的 Loss。因为问题是给定的，模型不需要学习如何生成问题。~~
+        # ~~假设序列总长 4000，其中问题 3500 词，回答 500 词。如果不裁剪，模型会生成一个 [Batch, 4000, 128000] 的巨型 Logits 张量。这在 FP32 精度下大约占用 2GB/样本。如果 Batch Size 是 8，光这一个变量就要 16GB 显存，直接导致显卡崩溃（OOM）。如果裁剪 (logits_to_keep=500)，通过 slice(-500, None)，模型只计算最后 500 个回答词的 Logits。~~
+
+        # 上述的“训练中的logits_to_keep”理解是错误的，一般来讲，在训练时一般不传入这个参数，只有推理会传入。训练（特别是像你进行的 SFT）是一个“全员考核”的过程。模型输入的每一个 Token（除去 Prompt 部分）都需要和 labels 进行对比。为了算 Loss，我们需要序列中每一个位置的预测结果（Logits）。
 
         loss = None
         if labels is not None:
