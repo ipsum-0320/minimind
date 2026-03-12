@@ -329,6 +329,12 @@ if __name__ == "__main__":
     reward_model = AutoModel.from_pretrained(
         args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
     )
+    
+    # 这里的奖励模型用的是 InternLM2-1.8B-Reward，其是在 InternLM2-Chat-1.8B-SFT 基础上训练得到的奖励模型。
+    # Reward 模型（奖励模型）和 SFT 模型（指令微调模型）确实是“同根同源”的亲兄弟。 它们拥有完全相同的“身体”（Transformer 骨干网络），只是换了一个“头”（输出层）和一套“灵魂”（训练目标）。
+    # SFT 模型 (分类头/语言模型头)，最后一层是一个 Linear(Hidden_Size, Vocab_Size)。任务是在词表里做“多分类”，预测下一个字是哪个（Next Token Prediction）。
+    # Reward 模型 (回归头/标量输出) 的结构是去掉那个巨大的词表输出层，换成一个 Linear(Hidden_Size, 1)。任务是将整个句子的语义压缩成一个单一的实数值（Scalar Score）。这个数字越大，代表人类越喜欢这个回答。
+
     reward_model = reward_model.to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
     # 数据和优化器

@@ -58,10 +58,23 @@ def get_lr(current_step, total_steps, lr):
 def init_distributed_mode():
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
+    # 判断当前是否处于分布式运行环境。
+    # 当使用 torchrun 或 mpirun 启动脚本时，系统会自动设置环境变量 RANK。
 
     dist.init_process_group(backend="nccl")
+    # 正式启动分布式进程组。
+    # backend="nccl" 是指定通信后端。对于 NVIDIA GPU 训练，nccl 是官方推荐且性能最强的后端，负责处理多卡之间的数据同步（如 All-Reduce 操作）。
+    
     local_rank = int(os.environ["LOCAL_RANK"])
+    # 获取当前机器上的 GPU 编号。
+    # 区别 RANK 与 LOCAL_RANK：
+    # * RANK 是整个集群（可能有多台机器）中的绝对编号（如 0-15）。
+    # * LOCAL_RANK 是当前这台服务器上的相对编号（如 0-7）。这通常对应我们要使用的具体显卡序号。
+
     torch.cuda.set_device(local_rank)
+    # 限定当前进程只能看到并使用指定的 GPU。
+    # 防止多个进程抢占同一块显卡，确保每个进程在自己的“领地”内（由 local_rank 指定的显卡）进行计算。
+
     return local_rank
 
 
@@ -246,26 +259,52 @@ def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', sav
 
 
 class SkipBatchSampler(Sampler):
+    # 为什么要继承 Sampler？定义类并继承自 torch.utils.data.Sampler。
+    # Sampler 是 PyTorch 数据读取流水线的核心组件，负责决定读取数据的顺序。
+
     def __init__(self, sampler, batch_size, skip_batches=0):
         self.sampler = sampler
+        # sampler 是基础采样器（如 SequentialSampler 或 DistributedSampler），决定原始索引顺序。
+
         self.batch_size = batch_size
+        # 每批样本的数量。
         self.skip_batches = skip_batches
+        # 重点参数，表示需要跳过多少个完整的 batch。
+        # 一个 step 就代表一个 batch。
 
     def __iter__(self):
-        batch = []
-        skipped = 0
+        # __iter__ 会在执行 for batch in dataloader: 的那一瞬间被调用。
+        batch = [] # 初始化当前批次容器。
+        skipped = 0 # 已跳过计数器。
+
         for idx in self.sampler:
+            # 遍历基础采样器产生的每一个样本索引（idx）。
             batch.append(idx)
+            # 将索引加入当前批次。
+
             if len(batch) == self.batch_size:
+                # 当凑齐了一个完整的 batch 时。
                 if skipped < self.skip_batches:
+                    # 关键判断。如果还没跳够指定的数量，则 skipped += 1，清空 batch 但不 yield（不返回给 DataLoader）。
                     skipped += 1
                     batch = []
                     continue
                 yield batch
+                # 如果已经跳够了，则将这个 batch 返回。
+                # yield 是一个生成器函数，执行到这里就会把 batch 返回出去，同时卡在这里。当你再次“拍一下”它（调用 next()），它会从刚才停下的地方直接继续往后跑。
                 batch = []
         if len(batch) > 0 and skipped >= self.skip_batches:
+            # 处理最后剩下的“散碎”样本（不足一个 batch 的部分），如果没被跳过则返回。
             yield batch
+            # 技术上来说，在这一行把 yield 换成 return 程序不会报错，但从编程规范和生成器逻辑的角度来看，这绝对不是一个好习惯。但一般来说，即使是最后一行，我们也坚持使用 yield。
 
     def __len__(self):
+        # 定义该采样器的“长度”协议。
+        # 当我们调用 len(my_skip_sampler) 时，Python 会自动执行此方法。
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        # 计算原始数据总共能凑成多少个 Batch。
+        # 假设你有 10 个样本 (len(self.sampler) = 10)，batch_size = 3。直接除 10 / 3 = 3.33。但在代码中，最后一个不足 3 个的样本也算 1 个 batch，所以应该是 4 个。
         return max(0, total_batches - self.skip_batches)
+        # 计算剩余可用的 Batch 数量，用总数减去你要求跳过的数量。
+        # 如果由于配置错误，skip_batches 设置得比总 batch 数还要大（比如总共 100 个 batch，你却要跳过 200 个），减法会得到 -100。
+        # 在 Python 中，__len__ 返回负数会直接抛出 ValueError。使用 max(0, ...) 确保即使跳过头了，也只是告诉程序“没数据了（长度为 0）”，而不会导致崩溃。

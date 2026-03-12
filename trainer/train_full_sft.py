@@ -225,7 +225,7 @@ if __name__ == "__main__":
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     # 如果是多卡训练，将当前进程绑定到对应的 GPU 上。
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
-    # 设置随机种子。注意：每张卡的种子微调了一下，防止多卡训练时读取完全相同的数据顺序。
+    # 设置随机种子。
     # 在这里引入随机数种子是为了引入多样性，这体现在 Dropout（随机丢弃神经元）或某些随机增强上。如果所有卡的 Dropout 位置完全一样，那多卡训练就变成了简单的“数值放大”；如果每张卡丢弃的位置略有不同，它们计算出的梯度就会有微小的差异，合并（All-reduce）后的梯度会更平滑，模型泛化能力更强。
     # 具体 seed 还影响了哪些因素，可以去看 setup_seed。
 
