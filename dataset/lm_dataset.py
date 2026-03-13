@@ -93,6 +93,7 @@ class PretrainDataset(Dataset):
         # 这个起始 token 就是 BOS
         #         ↓
         # 为了训练-推理一致，训练数据也要加 BOS
+        # BOS 应该在预训练阶段就引入，SFT 的数据量比预训练少了几个数量级，靠它来训练一个关键的特殊 token embedding 是非常不可靠的。
 
         # 添加 EOS 是因为代码中有一行：max_length=self.max_length - 2。如果原始文本非常长，分词器在截断（Truncation）时，可能会把文本末尾自带的 <|im_end|> 给截掉。因此通过 + [self.tokenizer.eos_token_id]，确保无论中间的内容怎么被截断，这个序列最终一定是以结束符结尾的。这保证了模型始终能学到“到此为止”的边界。
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
