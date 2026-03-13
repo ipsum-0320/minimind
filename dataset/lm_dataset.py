@@ -48,23 +48,63 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.05):
 # 二是保留 5% 的空块，是告诉模型：“有时候我也可能只是想了一下但啥也没想出来，这也是正常的。”这样模型在推理遇到空块时，不会因为没见过这种格式而崩掉。
 
 class PretrainDataset(Dataset):
+    # 它的核心逻辑是将原始文本转换为模型可以理解的 input_ids（数值序列），并生成用于计算交叉熵损失的 labels。
+    # 它继承自 PyTorch 的 Dataset 基类。这使得它可以配合 DataLoader 进行批量数据加载。
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = load_dataset('json', data_files=data_path, split='train')
+        # 使用 Hugging Face 的 datasets 库加载本地 JSON 文件，并读取 train 分片。
+        # dataset_dict = load_dataset('json', data_files=data_path)
+        # 结果是一个 DatasetDict: {'train': Dataset(...)}
+        # self.samples = dataset_dict['train']
+
+        # 对于代码这种情况，直接返回的就是 Dataset。
 
     def __len__(self):
+        # 返回数据集中样本的总数。
         return len(self.samples)
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        tokens = self.tokenizer(str(sample['text']), add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        # 根据索引 index 从 Dataset 中提取一条数据。
+        
+        tokens = self.tokenizer(str(sample['text']), 
+        add_special_tokens=False, max_length=self.max_length - 2, truncation=True).input_ids
+        # str(sample['text'])：获取文本字段并强制转为字符串。
+
+        # add_special_tokens=False：手动控制特殊符号，所以这里先不让分词器自动加 [CLS] 或 [SEP]。在 Hugging Face 的分词器中，默认情况下 add_special_tokens=True。如果你不关掉它，分词器会自动根据模型类型（如 BERT, GPT, Llama）在文本前后加上它认为“标准”的特殊符号。如果我们后续又手动加上了 bos_token_id 和 eos_token_id。那么最后这个数据就变成了 [BOS] [BOS] 文本...，这会导致模型输入格式错误，甚至让模型在训练时感到“困惑”。
+
+        # max_length=self.max_length - 2：预留 2 个位置给手动添加的 BOS 和 EOS。
+        # truncation=True：如果文本太长，直接截断。
+        # .input_ids：只取转换后的数字 ID 列表。
+
         tokens = [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
+        # 在文本 ID 序列的前后手动加上 BOS（Beginning of Sentence，通常是 <s>）和 EOS（End of Sentence，通常是 </s>）。
+        # 看到 BOS 时，意识到这是一个新句子的开始。
+        # 看到 EOS 时，学会预测句子到此结束，停止生成。
+
+        # 添加 BOS 可能与 Attention sink 相关。同时添加 BOS 也是为了保证训练和推理的一致，逻辑链如下：
+        # 根本原因：Transformer 解码器需要"输入"才能产生"输出"
+        #         ↓
+        # 推理时必须有一个起始 token 来触发第一步生成
+        #         ↓
+        # 这个起始 token 就是 BOS
+        #         ↓
+        # 为了训练-推理一致，训练数据也要加 BOS
+
+        # 添加 EOS 是因为代码中有一行：max_length=self.max_length - 2。如果原始文本非常长，分词器在截断（Truncation）时，可能会把文本末尾自带的 <|im_end|> 给截掉。因此通过 + [self.tokenizer.eos_token_id]，确保无论中间的内容怎么被截断，这个序列最终一定是以结束符结尾的。这保证了模型始终能学到“到此为止”的边界。
         input_ids = tokens + [self.tokenizer.pad_token_id] * (self.max_length - len(tokens))
+        # 计算当前序列长度与目标最大长度（max_length）的差值，然后在序列末尾补齐相应数量的 pad_token_id。这有如下两个目的：
+        # 1. 矩阵化计算：深度学习模型（尤其是 Transformer）需要将多个样本拼成一个 Batch（矩形矩阵）并行计算。如果样本长度不一，无法组成矩阵。
+        # 2. 长度对齐：确保无论原始句子多短，输出的张量长度始终是固定的（如 512）。
         input_ids = torch.tensor(input_ids, dtype=torch.long)
+        # 转化为 tensor 张量。
         labels = input_ids.clone()
+        # 深度拷贝一份 input_ids 作为 labels。
         labels[input_ids == self.tokenizer.pad_token_id] = -100
+        # 找到所有 input_ids 为 Padding 的位置，并将 labels 对应位置的值改为 -100。
         return input_ids, labels
 
 
