@@ -1423,7 +1423,21 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         # ~~指令微调（SFT），通常我们会输入一个 Prompt（问题）和一个 Answer（回答）。在 SFT 中，我们通常只计算 Answer 部分的 Loss。因为问题是给定的，模型不需要学习如何生成问题。~~
         # ~~假设序列总长 4000，其中问题 3500 词，回答 500 词。如果不裁剪，模型会生成一个 [Batch, 4000, 128000] 的巨型 Logits 张量。这在 FP32 精度下大约占用 2GB/样本。如果 Batch Size 是 8，光这一个变量就要 16GB 显存，直接导致显卡崩溃（OOM）。如果裁剪 (logits_to_keep=500)，通过 slice(-500, None)，模型只计算最后 500 个回答词的 Logits。~~
 
-        # 上述的“训练中的logits_to_keep”理解是错误的，一般来讲，在训练时一般不传入这个参数，只有推理会传入。训练（特别是像你进行的 SFT）是一个“全员考核”的过程。模型输入的每一个 Token（除去 Prompt 部分）都需要和 labels 进行对比。为了算 Loss，我们需要序列中每一个位置的预测结果（Logits）。
+        # ~~上述的“训练中的logits_to_keep”理解是错误的，一般来讲，在训练时一般不传入这个参数，只有推理会传入。训练（特别是像你进行的 SFT）是一个“全员考核”的过程。模型输入的每一个 Token（除去 Prompt 部分）都需要和 labels 进行对比。为了算 Loss，我们需要序列中每一个位置的预测结果（Logits）。~~
+
+        # ⭐️⭐️⭐️⭐️⭐️ 在 SFT 的阶段，在计算 loss 时，只考虑了 Response，不考虑 User Prompt，相应实现可以参考 Im_dataset.py 的 119 行，最后生成的 labels 是 [-100, ..., -100] [-100, ..., -100] [我是人工智能] [Assistant结束符] [-100, ...]。
+        # ⭐️⭐️⭐️⭐️⭐️ 即使在 Base 模型上进行指令遵循微调，也不应该关注 user prompt 带来的 loss。这是因为 SFT 的核心是关心生成结果的质量，而不是去学习如何生成问题。模型学习的是 P(resp|prompt)，而不是P(prompt+resp|[BOS])。
+        # ⭐️⭐️⭐️⭐️⭐️ 这里有一个误解是，不计算 loss != 不学习。虽然主流训练代码都会 mask prompt。
+        # ⭐️⭐️⭐️⭐️⭐️ 即使我们不参与对 user prompt 的 loss 计算，但是对 Response loss 的计算也会逼着模型学会理解 <im_start> 和 <im_end> 这样的对话格式，“强迫答案正确，你也就学会了理解题目”。
+        # ⭐️⭐️⭐️⭐️⭐️ 此外，因为参数 W 是共享的，处理 prompt 时用的 W 和处理 response 时用的 W 是同一个 W。 梯度更新了 W，就等于同时影响了模型处理 prompt 和 response 的方式。
+        # ⭐️⭐️⭐️⭐️⭐️ 那"不计算 Loss" 到底少了什么？
+        # 对 Prompt 计算 Loss:
+        # 模型学习："看到 [请] 之后，应该预测 [解释]"     ← 学习生成 prompt
+        # 模型学习："理解 prompt 以便生成好的 response"   ← 学习理解 prompt
+        
+        # 不对 Prompt 计算 Loss:
+        # 模型学习："理解 prompt 以便生成好的 response"   ← 只学习理解 prompt ✅
+        # 模型不学："看到 [请] 之后，应该预测 [解释]"     ← 不学生成 prompt ✅
 
         loss = None
         if labels is not None:
