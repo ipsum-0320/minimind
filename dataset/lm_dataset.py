@@ -248,46 +248,93 @@ class SFTDataset(Dataset):
 
 
 class DPODataset(Dataset):
+    # 核心逻辑是将对话数据（包含“被选中的”和“被拒绝的”回答）转换成模型可训练的 input_ids，并生成 Loss Mask
     def __init__(self, file_path, tokenizer, max_length=4096):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        # 如果 tokenizer 没有 pad_token，则默认用 id 0 填充
+
+        # 预先编码“回答开始”和“回答结束”的标识符，用于后续定位 Loss Mask 的范围。
+        # 这里通过 tokenizer 拼接特殊 token 和角色名（assistant）来确定边界。
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        # bos_id 就是回答的开始。
         self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+        # eos_id 就是回答的结束。
         self.samples = load_dataset('json', data_files=file_path, split='train')
+        # 使用 Hugging Face 的 datasets 库加载本地 JSON 文件
 
     def __len__(self):
         return len(self.samples)
+        # 返回整个数据集的长度。
 
     def __getitem__(self, index):
+        # 使用 daatset[x] 就是在调用这里的 __getitem__(index)。
+
+        # {"chosen": ... , "rejected": ... }
         sample = self.samples[index]
         chosen = sample['chosen']  # 是一个 list，里面包含若干 {role, content}
+        # [{"content": "我在哪里可以看到无色的花？", "role": "user"}, {"content": "作为一个人工智能语言模型，我没有个人经历或感受。但是，为了回答你的问题，无色的花在自然界中并不常见，因为花通常会有一些颜色来吸引传粉者。然而，一些罕见的花种可能由于基因突变或环境因素（如极端紫外线光线或缺乏阳光）而缺乏颜色。你可以向专门研究稀有植物物种的植物园或研究机构查询，看看他们是否展示了任何无色的花。", "role": "assistant"}]
         rejected = sample['rejected']  # 同上
+        # [{"content": "我在哪里可以看到无色的花？", "role": "user"}, {"content": "你好！我来帮助您解答问题。虽然花通常以其丰富多彩的花瓣而闻名，但也有一些花是无色或花瓣非常淡的。以下是一些可以考虑的选择：\n\n1. 白色花朵：许多花都有白色的品种，可以提供类似无色花朵的外观。一些受欢迎的白色花朵包括玫瑰、百合和康乃馨。\n2. 水仙花：这些明亮愉悦的花以其喇叭形状的花瓣而闻名，颜色可以从奶油白到淡黄色不等。\n3. 兰花：兰花以其精致和异国风情的外观而闻名，一些品种有淡色或无色的花瓣。\n4. 雏菊：尽管大多数雏菊有彩色花瓣，但一些品种，如雪绒花，有淡色花瓣，看起来几乎无色。\n\n请记住，要找到完全无色的花可能有些困难，因为许多花都有一定程度的着色。但是，这些选择可能会提供类似的外观，并为您的空间增添一丝优雅和美丽。\n\n如果您有任何进一步的问题或需要更多信息，请随时提问！", "role": "assistant"}]
+
         chosen_prompt = self.tokenizer.apply_chat_template(
             chosen, tokenize=False, add_generation_prompt=False
         )
-        chosen_prompt = post_processing_chat(chosen_prompt)
+        # apply_chat_template 的作用是
+        # [
+        #     {"role": "user", "content": "你好"},
+        #     {"role": "assistant", "content": "你好！很高兴见到你。"}
+        # ]
+        # 转化为 =>
+        # <|im_start|>user
+        # 你好<|im_end|>
+        # <|im_start|>assistant
+        # 你好！很高兴见到你。<|im_end|>
+
+        # add_generation_prompt=False 决定了是否在字符串的末尾添加一个“引导模型开始回答”的后缀。
+        # add_generation_prompt=True (通常用于 推理/预测)，它会在对话最后强行加上一段开启 assistant 回答的标记，但不包含回答内容。
+        # 结果：...<|im_end|>\n<|im_start|>assistant\n
+        # 目的：让模型知道：“轮到你了，快从这里开始写回复。”
+
+        # 一般来说，推理时要用这个参数，训练时不需要添加。
+
+        chosen_prompt = post_processing_chat(chosen_prompt) # 去除 <think>。
 
         rejected_prompt = self.tokenizer.apply_chat_template(
             rejected, tokenize=False, add_generation_prompt=False
         )
         rejected_prompt = post_processing_chat(rejected_prompt)
+        
         chosen_encoding = self.tokenizer(
             chosen_prompt, truncation=True, max_length=self.max_length, padding='max_length'
         )
         rejected_encoding = self.tokenizer(
             rejected_prompt, truncation=True, max_length=self.max_length, padding='max_length'
         )
+        # 首先他会进行 token 化，把文本变成一串 ID。
+        # 然后进行对齐，长的切短，短的补 0。
+        # 最后得到两个形状完全一样的 Tensor（或者说 List），长度都是 max_length。
 
         chosen_input_ids = chosen_encoding['input_ids']
         chosen_loss_mask = self.generate_loss_mask(chosen_input_ids)
 
         rejected_input_ids = rejected_encoding['input_ids']
         rejected_loss_mask = self.generate_loss_mask(rejected_input_ids)
+
+        # 生成 mask，精确定位出哪些 Token 是 AI 说的（Assistant 的回答），并将这些位置标记为 1。
+
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)
+        # 取 chosen_input_ids 中除了最后一个 token 以外的所有内容，并转为 PyTorch 张量。其会作为模型的输入 (Input)，模型看到这些词，准备预测接下来的词。
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)
+        # 取 chosen_input_ids 中除了第一个 token 以外的所有内容。其将会作为模型的标签 (Label/Target)。
         mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)
+        # 取 chosen_loss_mask 中除了第一个元素以外的部分。其作用是让掩码与标签 (y) 一一对应。因为 y_chosen 是我们要预测的目标。如果我们想计算某个位置的 Loss，掩码必须精准地覆盖在 y 上。
+        # 输入 (x): A  B  C
+        # 标签 (y): B  C  D
+        # 掩码 (m): 0  1  1 （表示只对预测 C 和 D 时计算 Loss）
+
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)
@@ -300,24 +347,41 @@ class DPODataset(Dataset):
             'y_rejected': y_rejected,
             'mask_rejected': mask_rejected
         }
+        # 将处理好的数据打包成字典返回。当后续在训练循环（Training Loop）中使用 DataLoader 迭代时，每个 batch 都会拿到这 6 个张量。
 
     def generate_loss_mask(self, input_ids):
+        # 精确定位出哪些 Token 是 AI 说的（Assistant 的回答），并将这些位置标记为 1，其余位置（User 的提问、系统提示词、Padding 等）标记为 0。
         loss_mask = [0] * len(input_ids)
+        # 创建一个和输入序列等长的列表，默认全是 0（代表不计算 Loss）。
         i = 0
         while i < len(input_ids):
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
+                # 它在序列中不断滑动寻找 self.bos_id（即 <|im_start|>assistant\n 对应的 ID 序列）。
+                # 一旦匹配成功，说明从这里开始，后面就是 AI 的回答了。
                 start = i + len(self.bos_id)
+                # 回答的真正起点（跳过 assistant 标记本身）
                 end = start
                 while end < len(input_ids):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
+                        # 找到了回答结束标记（<|im_end|>）
                         break
                     end += 1
+                    # 尾指针不断增加。
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
+                    # 终点是 min(end + len(self.eos_id), self.max_length)。
+                    # + len(self.eos_id) 的意思是把结束符本身也包含进 Loss 计算中。因为模型不仅要学会说话，还要学会什么时候闭嘴。如果 Loss 不覆盖结束符，模型可能学会一直滔滔不绝停不下来。
+
+                    # 为什么要用 min？
+                    # 万一由于某种原因（比如截断），回答的结束符被挤掉了，或者回答非常长超出了数组范围，min 可以确保索引 j 永远不会超过数组的最大边界，从而避免程序报错。
                     loss_mask[j] = 1
+                    # 将 start 到 end（包含结束符）之间的所有位置都设为 1。
+                    # 这样模型在计算 Loss 时，就只看这些标记为 1 的 Token。
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+                # 处理完一段回答后，把指针 i 直接跳到这段回答之后，寻找下一个可能的对话轮次。
             else:
-                i += 1
+                i += 1 # i 自增
         return loss_mask
+        # 返回 loss_mask，[0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0]。
 
 
 class RLAIFDataset(Dataset):
