@@ -1445,6 +1445,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             shift_labels = labels[..., 1:].contiguous()
             # 进行错位。
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+            # ⭐️⭐️⭐️⭐️⭐️ 这里的交叉熵 loss 的计算和 dpo、grpo 中的 logits_to_log_probs 的计算方式是完全一样的，唯一的不同就是 label，grpo 的 label 取自自己的采样。
+            # step 1，log_probs = F.log_softmax(logits, dim=-1)
+            # step 2，target_logp = log_probs.gather(dim=-1, index=labels)
+            # step 3，loss = -target_logp.mean()
+
             # 计算交叉熵损失。
             # 这是一个非常关键的约定。在数据预处理时，我们会把不需要计算 Loss 的部分（比如 Padding 或者 Prompt 部分）的标签设为 -100。
             # Label 是不是 -100，就是决定模型“学不学习这个词”的唯一信号灯。

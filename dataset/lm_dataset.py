@@ -385,40 +385,56 @@ class DPODataset(Dataset):
 
 
 class RLAIFDataset(Dataset):
+    # 定义一个继承自 PyTorch Dataset 的类。
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.samples = load_dataset('json', data_files=jsonl_path, split='train')
+        self.samples = load_dataset('json', data_files=jsonl_path,
+         split='train')
+        # 使用 HuggingFace 的 load_dataset 加载本地 JSONL 数据文件。
+        # 数据格式为如下 =>
+        # {"conversations": [{"role": "user", "content": "名言\"性相近也，习相远也\"出自哪位古代思想家？"}, {"role": "assistant", "content": "空"}]}，在 RL 训练中，不需要 assistant 的输出。
         self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer(f'{tokenizer.eos_token}', add_special_tokens=False).input_ids
+        # 预先编码并保存 BOS（序列开始）和 EOS（序列结束）的 Token ID。
+        # 这里的写法是针对特定格式拼接了 "assistant" 标识，用于后续定位。
 
     def __len__(self):
         return len(self.samples)
+    # 返回整个数据集的长度。
 
     def create_chat_prompt(self, conversations):
         messages = []
+        # 用于存储符合 OpenAI 格式的对话列表
         answer = ''
+        # 用于存储最后一轮回复，也就是我们期望的答案，其余的回复都是用作 RL 的上下文。这里的设计是考虑到了多轮对话。
         for i, turn in enumerate(conversations):
+            # 偶数轮视为用户（user），奇数轮视为助手（assistant）
             role = 'user' if i % 2 == 0 else 'assistant'
             messages.append({"role": role, "content": turn['content']})
             answer = turn['content']
+            # 循环结束时，answer 会保留最后一轮的内容，这是考虑到了多轮对话。
         prompt = self.tokenizer.apply_chat_template(
-            messages[:-1],
+            messages[:-1], # 排除最后一轮（因为最后一轮是我们要训练/预测的答案）
             tokenize=False,
-            add_generation_prompt=True  # 这里需要True
+            add_generation_prompt=True  # 这里需要 True
+            # 在末尾添加“助手开始回答”的引导符，因为会用于推理。
         )
+        # 使用分词器的模板功能，将 messages 列表转换为一个长字符串。
         prompt = post_processing_chat(prompt)
+        # 去掉空的 <think></think> 字符。
         return prompt, answer
 
     def __getitem__(self, index):
         sample = self.samples[index]
         prompt, answer = self.create_chat_prompt(sample['conversations'])
-
+        # 返回最终的结果。
         return {
             'prompt': prompt,
             'answer': answer
         }
+        
 
 if __name__ == "__main__":
     pass

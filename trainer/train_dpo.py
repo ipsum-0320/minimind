@@ -75,6 +75,8 @@ def logits_to_log_probs(logits, labels):
     # 数值：每个位置上的数值就是模型预测那个正确 token 的对数概率。
 
     return log_probs_per_token
+    # ⭐️⭐️⭐️⭐️⭐️ 这个值表示在当前模型看来，在已知前面所有词的情况下，写下『这个特定词』的可能性（对数概率）有多大
+    # 这里的已知前面所有词的情况下非常重要，因为 logits 就是这么来的，他是 NTP 获取的。
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
@@ -84,6 +86,12 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # 防止零长度mask导致除零NaN
     # 统计每个样本中 assistant 回答部分的真实长度（即 Mask 中 1 的个数）。clamp_min(1e-8) 是一个安全保险。如果某条数据全是 Mask 0（异常数据），长度会变成一个极小的正数，防止后面除法时出现 NaN（除零错误）。
     # clamp_min(保底值)，如果数值小于这个保底值，就强制让它等于这个保底值；如果数值本来就比保底值大，那就保持原样。
+
+    # 关于整个序列的概率表示应该是 sum 还是 mean，可以参考 github 中原作者的回答：
+    # 严格来说对于整个序列的概率应该是各个token概率的乘积（对数概率相加），所以使用 .sum(dim=1)，但是需要平均对数概率：
+    # 1. 避免 loss 忽视长序列（因为长序列的 logits 总和会天然更小）。
+    # 2. 不同长度 text 对 loss 影响更均衡。
+    # 如果希望长序列和短序列的贡献不同，用sum；如果希望不同长度的样本贡献均衡，用mean。
 
     ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     # 这行代码将“逐个 Token 的概率”转化为“整条回答的得分”，其可被描述为如下三步：
@@ -100,7 +108,7 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     # 3. / seq_lengths.squeeze() —— 长度归一化（取平均）。
     # * 用总分除以回答部分的实际 Token 数量（seq_lengths），其实就是 Assistant 的回答 token 数。
     # * 为什么要这样做？
-    # - 消除长度偏见：如果不除以长度，长句子因为 Token 多，累加出来的 logP 绝对值会非常大。
+    # - 消除长度偏见：如果不除以长度，长句子因为 Token 多，累加出来的 logP 绝对值会非常小。
     # - 公平竞争：归一化后，得到的是平均每个 Token 的概率。这样短回答和长回答就能在同一个尺度下进行对比。
     # - 训练稳定性：平均值的波动比总和小，有助于梯度下降更平稳。
 
@@ -214,8 +222,15 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             # 重点是这里的 policy_log_probs 的 shape 是 (batch, seq_len)。
             # 这里的 batch 是 batch_chosen 和 batch_rejected 的组合。
             
-            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
             # 计算 dpo loss。
+            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=beta)
+            # ⭐️⭐️⭐️⭐️⭐️ DPO 其实和 SFT 非常相似，在采样 policy model 的输出的时候，也是基于了 shift label 的方式去采样的。
+            # 也就是说 DPO 在训练时，和 SFT 一样是在做高度并行的 NTP 的。我们可以把 Prompt + Answer 整个长序列一次性丢进 Transformer。利用 Transformer 的 Causal Mask（因果掩码），模型在计算第 n 个位置的 Logits 时，会自动“并行地”参考前 n-1 个 Token。
+            # 这一步是并行的。无论序列多长，一次 Forward Pass（前向传播）就能算出整句话所有 Token 的概率。这也就是为什么 DPO 训练很快。
+
+            # 此外，这也是为什么 DPO 的 Logits 和 Label 的长度确实是严格对齐的。但是这也就带来一个问题，DPO 是在强迫模型去精确模仿 chosen 样本的每一个 Token，包括它的长度、语气、甚至废话。
+
+            # 因此，LLM RL 来了！
 
             loss = dpo_loss_val + outputs.aux_loss
             loss = loss / args.accumulation_steps
